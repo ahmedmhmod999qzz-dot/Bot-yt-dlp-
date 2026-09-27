@@ -225,7 +225,29 @@ def set_webhook():
             logging.error(f"Failed to set webhook: {e}")
     else:
         logging.warning("RENDER_EXTERNAL_URL not set. Webhook not configured.")
-
+# --- نقطة نهاية لتعيين Webhook يدوياً (محمية) ---
+@app.route('/setup', methods=['GET'])
+def setup_webhook():
+    """تعيين Webhook يدوياً. استخدمها مرة واحدة بعد النشر."""
+    # مفتاح حماية بسيط (غيّر القيمة إلى شيء سري)
+    SECRET_KEY = os.environ.get("SETUP_KEY", "change_me_123")
+    provided_key = request.args.get('key')
+    
+    if provided_key != SECRET_KEY:
+        return "Unauthorized", 401
+    
+    if not RENDER_URL:
+        return "RENDER_EXTERNAL_URL is not set. Cannot configure webhook.", 500
+    
+    webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
+    try:
+        bot.remove_webhook()
+        result = bot.set_webhook(url=webhook_url)
+        logging.info(f"Webhook set to: {webhook_url}")
+        return f"Webhook set successfully to: {webhook_url}", 200
+    except Exception as e:
+        logging.error(f"Failed to set webhook: {e}")
+        return f"Error: {e}", 500
 # --- التشغيل ---
 if __name__ == '__main__':
     # تعيين Webhook في خيط منفصل لتجنب تعليق بدء التشغيل
