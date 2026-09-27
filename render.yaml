@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: telegram-video-bot
+    runtime: python
+    plan: free
+    buildCommand: |
+      # 1. تثبيت مكتبات Python
+      pip install -r requirements.txt
+      
+      # 2. تثبيت yt-dlp كأداة مساعدة (Binary)
+      curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+      chmod a+rx /usr/local/bin/yt-dlp
+      
+      # 3. تثبيت ffmpeg (ضروري لدمج الفيديو والصوت بأعلى جودة)
+      apt-get update && apt-get install -y ffmpeg || true
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 600
+    envVars:
+      - key: BOT_TOKEN
+        sync: false  # سيتم إدخال القيمة يدوياً في لوحة تحكم Render
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    healthCheckPath: /health
