@@ -310,42 +310,180 @@ def get_available_formats(url: str) -> list:
         logging.error(f"get_available_formats error: {e}")
         return []
 
+
 def download_video(url, output_path, chat_id=None, msg_id=None, quality_label="Auto"):
-    ydl_opts = base_ydl_opts()
-    ydl_opts.update({
+    """
+    تنزيل بأعلى جودة مع دعم كامل لجميع المنصات.
+    يستخدم 3 محاولات متتالية مع إعدادات مختلفة لتجنب الفشل.
+    """
+    original_url = url
+    is_twitter = any(d in url for d in ['twitter.com', 'x.com'])
+    is_tiktok = 'tiktok.com' in url
+    is_instagram = 'instagram.com' in url
+
+    # تحويل روابط تويتر إلى fxtwitter (يعمل بشكل أفضل مع yt-dlp)
+    if is_twitter:
+        url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
+        logging.info(f"Twitter URL converted: {url}")
+
+    # قائمة الإعدادات للتجربة المتتالية
+    attempts = []
+
+    # محاولة 1: الإعدادات المثالية (أفضل جودة مع دمج)
+    opts1 = base_ydl_opts()
+    opts1.update({
         'format': 'bv*+ba/b',
         'merge_output_format': 'mp4',
         'outtmpl': output_path,
     })
+    if is_twitter:
+        opts1['extractor_args'] = {'twitter': {'api': ['syndication']}}
+    if is_tiktok:
+        opts1['format'] = 'b'  # تيك توك يقدم ملفات مدمجة جاهزة
     if chat_id and msg_id:
-        ydl_opts['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return True, None
-    except yt_dlp.utils.DownloadError as e:
-        return False, translate_error(str(e))
-    except Exception as e:
-        return False, f"Technical error: {type(e).__name__}"
+        opts1['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+    attempts.append(('optimal', url, opts1))
+
+    # محاولة 2: الرابط الأصلي (بدون تحويل) مع إعدادات بديلة
+    if is_twitter:
+        opts2 = base_ydl_opts()
+        opts2.update({
+            'format': 'bv*+ba/b',
+            'merge_output_format': 'mp4',
+            'outtmpl': output_path,
+            'extractor_args': {'twitter': {'api': ['legacy']}},
+        })
+        if chat_id and msg_id:
+            opts2['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+        attempts.append(('twitter_legacy', original_url, opts2))
+
+    # محاولة 3: أفضل ملف مدمج (يتجنب الدمج الذي قد يفشل)
+    opts3 = base_ydl_opts()
+    opts3.update({
+        'format': 'b',
+        'outtmpl': output_path,
+    })
+    if chat_id and msg_id:
+        opts3['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+    attempts.append(('best_merged', original_url, opts3))
+
+    # محاولة 4: أسوأ جودة (كحل أخير)
+    opts4 = base_ydl_opts()
+    opts4.update({
+        'format': 'w',
+        'outtmpl': output_path,
+    })
+    if chat_id and msg_id:
+        opts4['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+    attempts.append(('worst', original_url, opts4))
+
+    last_error = None
+    for attempt_name, attempt_url, opts in attempts:
+        try:
+            logging.info(f"Trying download [{attempt_name}]: {attempt_url[:80]}")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([attempt_url])
+            logging.info(f"Success with [{attempt_name}]")
+            return True, None
+        except yt_dlp.utils.DownloadError as e:
+            last_error = str(e)
+            logging.warning(f"[{attempt_name}] failed: {last_error[:150]}")
+            continue
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            logging.warning(f"[{attempt_name}] exception: {last_error[:150]}")
+            continue
+
+    # فشلت كل المحاولات - جرب gallery-dl
+    if is_twitter or is_instagram:
+        logging.info("All yt-dlp attempts failed, trying gallery-dl...")
+        try:
+            from gallery_dl import job
+            temp_dir = os.path.dirname(output_path) + "/gallery_fallback"
+            os.makedirs(temp_dir, exist_ok=True)
+            config = {
+                'base-directory': temp_dir,
+                'filename': '{num:03d}_{filename}.{extension}',
+                'quiet': True,
+            }
+            j = job.DownloadJob(original_url, config=config)
+            j.run()
+            files = sorted([f for f in os.listdir(temp_dir)
+                            if os.path.isfile(os.path.join(temp_dir, f))])
+            import shutil
+            for f in files:
+                if f.endswith(('.mp4', '.webm', '.mov', '.mkv')):
+                    shutil.move(os.path.join(temp_dir, f), output_path)
+                    return True, None
+        except Exception as ge:
+            logging.error(f"gallery-dl fallback failed: {ge}")
+
+    return False, translate_error(last_error or "All attempts failed")
+
 
 def download_specific_format(url, output_path, format_id, chat_id=None, msg_id=None, quality_label="Custom"):
-    ydl_opts = base_ydl_opts()
-    ydl_opts.update({
+    """
+    تنزيل جودة محددة مع نظام محاولات متعدد.
+    """
+    original_url = url
+    if any(d in url for d in ['twitter.com', 'x.com']):
+        url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
+
+    attempts = []
+
+    # محاولة 1: الجودة المطلوبة + أفضل صوت
+    opts1 = base_ydl_opts()
+    opts1.update({
         'format': f'{format_id}+ba/b',
         'merge_output_format': 'mp4',
         'outtmpl': output_path,
     })
     if chat_id and msg_id:
-        ydl_opts['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return True, None
-    except yt_dlp.utils.DownloadError as e:
-        return False, translate_error(str(e))
-    except Exception as e:
-        return False, f"Technical error: {type(e).__name__}"
+        opts1['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+    attempts.append(('specific+audio', url, opts1))
 
+    # محاولة 2: الجودة المطلوبة فقط (بدون دمج)
+    opts2 = base_ydl_opts()
+    opts2.update({
+        'format': format_id,
+        'outtmpl': output_path,
+    })
+    if chat_id and msg_id:
+        opts2['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+    attempts.append(('specific_only', original_url, opts2))
+
+    # محاولة 3: أعلى جودة متاحة أقل من أو تساوي المطلوب
+    try:
+        height = format_id.replace('p', '').strip()
+        if height.isdigit():
+            opts3 = base_ydl_opts()
+            opts3.update({
+                'format': f'bv*[height<={height}]+ba/b[height<={height}]/b',
+                'merge_output_format': 'mp4',
+                'outtmpl': output_path,
+            })
+            if chat_id and msg_id:
+                opts3['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+            attempts.append(('height_filter', original_url, opts3))
+    except Exception:
+        pass
+
+    last_error = None
+    for attempt_name, attempt_url, opts in attempts:
+        try:
+            logging.info(f"Trying format download [{attempt_name}]")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([attempt_url])
+            return True, None
+        except yt_dlp.utils.DownloadError as e:
+            last_error = str(e)
+            logging.warning(f"[{attempt_name}] failed: {last_error[:150]}")
+            continue
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            continue
+
+    return False, translate_error(last_error or "Format download failed")
 def download_audio(url, output_path):
     ydl_opts = base_ydl_opts()
     ydl_opts.update({
