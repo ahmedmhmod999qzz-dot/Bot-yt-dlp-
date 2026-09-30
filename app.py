@@ -123,6 +123,26 @@ def format_size(mb: float) -> str:
         return f"{mb/1024:.2f} GB"
     return f"{mb:.1f} MB"
 
+def escape_html(text: str) -> str:
+    """تهريب رموز HTML الخاصة."""
+    if not text:
+        return ""
+    return (str(text)
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;'))
+
+def clean_title(title: str) -> str:
+    """إزالة الهاشتاجات والروابط من العنوان."""
+    if not title:
+        return "Media"
+    title = re.sub(r'#\S+', '', title)
+    title = re.sub(r'https?://\S+', '', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    if not title or len(title) < 3:
+        return "Media"
+    return title
+
 def build_compact_caption(info):
     """بناء Caption مختصر ومرتب لتفاصيل الفيديو."""
     qualities = info['qualities'][:5]
@@ -130,8 +150,8 @@ def build_compact_caption(info):
     duration = format_duration(info['duration'])
     size_str = format_size(info['size_mb']) if info['size_mb'] else "Unknown"
     audio_str = "Yes" if info['has_audio'] else "No"
-    platform = info['platform']
-    title = info['title'][:70]
+    platform = escape_html(info['platform'])
+    title = escape_html(clean_title(info['title'])[:80])
 
     return (
         f"<b>{title}</b>\n"
@@ -182,7 +202,6 @@ def progress_hook_factory(chat_id: int, msg_id: int, quality_label: str):
         except Exception as e:
             logging.error(f"progress_hook error: {e}")
     return hook
-
 # ============================================================
 # yt-dlp options and functions
 # ============================================================
@@ -736,13 +755,23 @@ def process_download(task: dict):
 
 
 def auto_hide_caption(chat_id, msg_id, minimal_text):
-    """إخفاء التفاصيل تلقائياً بعد المهلة."""
+    """إخفاء التفاصيل مع الحفاظ على الأزرار."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("Details", callback_data="toggle_details"),
+        types.InlineKeyboardButton("More", callback_data="more"),
+    )
     try:
-        bot.edit_message_caption(minimal_text, chat_id, msg_id, parse_mode="HTML")
-        logging.info(f"Caption hidden for message {msg_id}")
+        bot.edit_message_caption(
+            caption=minimal_text,
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+        logging.info(f"Caption hidden for {msg_id}")
     except Exception as e:
-        logging.warning(f"auto_hide_caption failed for {msg_id}: {e}")
-
+        logging.warning(f"auto_hide_caption failed: {e}")
 
 def send_gallery(chat_id, files):
     try:
@@ -830,22 +859,30 @@ def handle_toggle_details(call):
     current_caption = (call.message.caption or "").strip()
     details = (cache['details'] or "").strip()
 
-    if current_caption == details:
-        # Hide now
-        try:
-            bot.edit_message_caption(cache['minimal'], chat_id, msg_id)
-            bot.answer_callback_query(call.id, "Details hidden")
-        except Exception as e:
-            logging.error(f"hide caption failed: {e}")
-            bot.answer_callback_query(call.id, "Failed")
-    else:
-        # Show
-        try:
-            bot.edit_message_caption(cache['details'], chat_id, msg_id)
-            bot.answer_callback_query(call.id, "Details shown")
-        except Exception as e:
-            logging.error(f"show caption failed: {e}")
-            bot.answer_callback_query(call.id, "Failed")
+    # احتفظ بالأزرار في كل تعديل
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("Details", callback_data="toggle_details"),
+        types.InlineKeyboardButton("More", callback_data="more"),
+    )
+
+    target = cache['minimal'] if current_caption == details else cache['details']
+
+    try:
+        bot.edit_message_caption(
+            caption=target,
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup=markup,
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(
+            call.id,
+            "Details hidden" if current_caption == details else "Details shown"
+        )
+    except Exception as e:
+        logging.error(f"toggle failed: {e}")
+        bot.answer_callback_query(call.id, "Failed")
 
 @bot.callback_query_handler(func=lambda call: call.data == 'more')
 def handle_more(call):
