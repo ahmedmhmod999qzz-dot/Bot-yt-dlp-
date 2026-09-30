@@ -14,7 +14,7 @@ import telebot
 from telebot import types
 
 # ============================================================
-# الإعدادات
+# Configuration
 # ============================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -28,7 +28,7 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 logging.info(f"FFmpeg path: {FFMPEG_PATH}")
 
 # ============================================================
-# النطاقات المسموح بها
+# Allowed domains
 # ============================================================
 ALLOWED_DOMAINS = {
     'youtube.com', 'youtu.be', 'm.youtube.com',
@@ -63,7 +63,7 @@ def is_allowed_url(url: str) -> bool:
         return False
 
 # ============================================================
-# Rate Limiting
+# Rate limiting
 # ============================================================
 user_requests = defaultdict(list)
 RATE_LIMIT_WINDOW = 60
@@ -79,13 +79,12 @@ def check_rate_limit(user_id: int):
     return True, 0
 
 # ============================================================
-# الطابور
+# Queue and shared state
 # ============================================================
 download_queue = queue.Queue(maxsize=100)
-
-# تتبع التقدم لكل مستخدم: {user_id: {'msg_id':, 'chat_id':, 'last_update':, 'text':}}
-progress_tracker = {}
+user_pending = {}          # {user_id: url} for "More" button
 progress_lock = threading.Lock()
+last_progress_update = {}  # {msg_id: timestamp}
 
 def download_worker():
     while True:
@@ -101,72 +100,73 @@ def download_worker():
             logging.error(f"Worker error: {e}", exc_info=True)
 
 # ============================================================
-# شريط التقدم
+# Helpers
 # ============================================================
-def make_progress_bar(percent: float, length: int = 15) -> str:
-    filled = int(length * percent / 100)
-    return "━" * filled + "─" * (length - filled)
+def format_duration(seconds) -> str:
+    if not seconds:
+        return "Unknown"
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
-def format_bytes(b) -> str:
-    if not b:
-        return "?"
-    b = float(b)
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if b < 1024:
-            return f"{b:.1f}{unit}"
-        b /= 1024
-    return f"{b:.1f}TB"
+def format_size(mb: float) -> str:
+    if not mb:
+        return "Unknown"
+    if mb >= 1024:
+        return f"{mb/1024:.2f} GB"
+    return f"{mb:.1f} MB"
 
-def progress_hook_factory(user_id: int, chat_id: int, msg_id: int):
-    """يرجع دالة progress_hook مخصصة لهذا التنزيل."""
+def make_blocks_bar(percent: float, length: int = 16) -> str:
+    filled = int(length * max(0, min(100, percent)) / 100)
+    return "█" * filled + "░" * (length - filled)
+
+def progress_message_text(percent: float, quality: str, size_str: str) -> str:
+    bar = make_blocks_bar(percent)
+    return (
+        f"Downloading\n\n"
+        f"<code>{bar}</code> {percent:.0f}%\n\n"
+        f"Quality: {quality}\n"
+        f"Format: MP4\n"
+        f"Size: {size_str}"
+    )
+
+def progress_hook_factory(chat_id: int, msg_id: int, quality_label: str):
     def hook(d):
         try:
-            if d['status'] == 'downloading':
-                now = time.time()
-                with progress_lock:
-                    info = progress_tracker.get(user_id, {})
-                    last = info.get('last_update', 0)
-                    if now - last < 3:  # تحديث كل 3 ثواني فقط
-                        return
-                    progress_tracker[user_id] = {'last_update': now}
+            if d['status'] != 'downloading':
+                return
+            now = time.time()
+            with progress_lock:
+                last = last_progress_update.get(msg_id, 0)
+                if now - last < 2:
+                    return
+                last_progress_update[msg_id] = now
 
-                downloaded = d.get('downloaded_bytes', 0)
-                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-                speed = d.get('speed') or 0
-                eta = d.get('eta') or 0
-                percent = (downloaded / total * 100) if total > 0 else 0
+            downloaded = d.get('downloaded_bytes', 0) or 0
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            percent = (downloaded / total * 100) if total > 0 else 0
 
-                bar = make_progress_bar(percent)
-                text = (
-                    f"جاري التنزيل...\n\n"
-                    f"<code>{bar}</code> {percent:.1f}%\n"
-                    f"الحجم: {format_bytes(downloaded)} / {format_bytes(total)}\n"
-                    f"السرعة: {format_bytes(speed)}/s\n"
-                    f"الوقت المتبقي: {eta} ثانية"
-                )
+            size_str = f"{format_size(downloaded / (1024*1024))}"
+            if total > 0:
+                size_str += f" / {format_size(total / (1024*1024))}"
 
-                try:
-                    bot.edit_message_text(text, chat_id, msg_id)
-                except Exception:
-                    pass  # تجاهل أخطاء تعديل الرسالة
-
-            elif d['status'] == 'finished':
-                try:
-                    bot.edit_message_text(
-                        "اكتمل التنزيل. جاري معالجة الملف...",
-                        chat_id, msg_id
-                    )
-                except Exception:
-                    pass
+            text = progress_message_text(percent, quality_label, size_str)
+            try:
+                bot.edit_message_text(text, chat_id, msg_id)
+            except Exception:
+                pass
         except Exception as e:
             logging.error(f"progress_hook error: {e}")
     return hook
 
 # ============================================================
-# دوال التنزيل
+# yt-dlp options and functions
 # ============================================================
 def base_ydl_opts():
-    """الخيارات المشتركة بين كل التنزيلات."""
     return {
         'noplaylist': True,
         'retries': 10,
@@ -184,66 +184,87 @@ def base_ydl_opts():
         'no_color': True,
     }
 
-def download_video(url: str, output_path: str, user_id: int = None,
-                   chat_id: int = None, msg_id: int = None) -> tuple[bool, str]:
-    """تنزيل الفيديو بأعلى جودة."""
-    ydl_opts = base_ydl_opts()
-    ydl_opts.update({
-        'format': 'bv*+ba/b',
-        'merge_output_format': 'mp4',
-        'outtmpl': output_path,
-    })
-    if user_id and chat_id and msg_id:
-        ydl_opts['progress_hooks'] = [progress_hook_factory(user_id, chat_id, msg_id)]
+def translate_error(err: str) -> str:
+    if 'Private video' in err or 'This video is private' in err:
+        return "This video is private."
+    if 'not available' in err or 'This video is not available' in err:
+        return "Video is not available or has been removed."
+    if 'region' in err.lower() or 'geo' in err.lower():
+        return "Video is geo-blocked in your region."
+    if 'Login required' in err or 'Sign in' in err:
+        return "This content requires login."
+    if 'Unsupported URL' in err:
+        return "URL is not supported."
+    if 'HTTP Error 429' in err:
+        return "Rate limit exceeded. Try again later."
+    if 'HTTP Error 403' in err:
+        return "Server rejected the request (403)."
+    if 'HTTP Error 404' in err:
+        return "Video not found (404)."
+    if 'Unexpected response' in err:
+        return "Target server rejected the request. Try again."
+    if 'Unable to extract' in err:
+        return "Unable to extract video data."
+    if 'Video unavailable' in err:
+        return "Video unavailable."
+    if 'ffmpeg' in err.lower():
+        return "Video processing error (ffmpeg)."
+    clean = err.replace('ERROR:', '').strip()
+    return f"Download failed: {clean[:200]}"
 
+def get_media_info(url: str):
+    """Fetch media metadata without downloading."""
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'no_color': True,
+    }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return True, None
-    except yt_dlp.utils.DownloadError as e:
-        err = str(e)
-        logging.error(f"DownloadError: {err}")
-        return False, translate_error(err)
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        logging.error(f"Download exception: {err}", exc_info=True)
-        return False, f"خطأ تقني: {type(e).__name__} - {str(e)[:200]}"
+            info = ydl.extract_info(url, download=False)
+            if 'entries' in info:
+                info = info['entries'][0]
 
-def translate_error(err: str) -> str:
-    """ترجمة أخطاء yt-dlp إلى رسائل عربية واضحة."""
-    if 'Private video' in err or 'This video is private' in err:
-        return "الفيديو خاص ولا يمكن تنزيله."
-    if 'not available' in err or 'This video is not available' in err:
-        return "الفيديو غير متاح أو تم حذفه."
-    if 'region' in err.lower() or 'geo' in err.lower():
-        return "الفيديو محجوب جغرافياً في منطقتك."
-    if 'Login required' in err or 'Sign in' in err:
-        return "هذا المحتوى يتطلب تسجيل دخول."
-    if 'Unsupported URL' in err:
-        return "الرابط غير مدعوم من yt-dlp."
-    if 'HTTP Error 429' in err:
-        return "تم تجاوز حد الطلبات. حاول بعد دقائق."
-    if 'HTTP Error 403' in err:
-        return "الموقع رفض الطلب (403). قد يحتاج الأمر تحديث yt-dlp."
-    if 'HTTP Error 404' in err:
-        return "الفيديو غير موجود (404)."
-    if 'Unexpected response' in err:
-        return "الموقع المستهدف رفض الطلب. تأكد من الرابط أو حاول مجدداً."
-    if 'Unable to extract' in err:
-        return "تعذر استخراج بيانات الفيديو. قد يكون الرابط غير صحيح."
-    if 'Video unavailable' in err:
-        return "الفيديو غير متاح."
-    if 'ffmpeg' in err.lower():
-        return "خطأ في معالجة الفيديو (ffmpeg)."
-    # إذا لم نتعرف على الخطأ، أرجع نصاً مختصراً منه
-    clean = err.replace('ERROR:', '').strip()
-    return f"فشل التنزيل: {clean[:200]}"
+            title = info.get('title', 'Unknown')
+            duration = info.get('duration', 0)
+            thumbnail = info.get('thumbnail')
+            extractor = info.get('extractor_key') or info.get('extractor') or 'Unknown'
+
+            formats = info.get('formats', [])
+            heights = set()
+            has_audio = False
+            best_size = 0
+            for f in formats:
+                h = f.get('height')
+                if h and f.get('vcodec') and f.get('vcodec') != 'none':
+                    heights.add(h)
+                if f.get('acodec') and f.get('acodec') != 'none':
+                    has_audio = True
+                fs = f.get('filesize') or f.get('filesize_approx')
+                if fs and fs > best_size:
+                    best_size = fs
+
+            return {
+                'title': title,
+                'duration': duration,
+                'thumbnail': thumbnail,
+                'platform': extractor,
+                'qualities': sorted(heights, reverse=True),
+                'has_audio': has_audio,
+                'size_mb': round(best_size / (1024*1024), 1) if best_size else 0,
+            }
+    except Exception as e:
+        logging.error(f"get_media_info error: {e}")
+        return None
 
 def get_available_formats(url: str) -> list:
     ydl_opts = base_ydl_opts()
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            if 'entries' in info:
+                info = info['entries'][0]
             formats = []
             for f in info.get('formats', []):
                 if f.get('vcodec') == 'none':
@@ -253,12 +274,10 @@ def get_available_formats(url: str) -> list:
                     continue
                 filesize = f.get('filesize') or f.get('filesize_approx') or 0
                 size_mb = filesize / (1024 * 1024)
-                fmt_id = f.get('format_id', '')
                 formats.append({
-                    'id': fmt_id,
+                    'id': f.get('format_id', ''),
                     'height': height,
                     'size_mb': round(size_mb, 1),
-                    'label': f"{height}p ({size_mb:.0f}MB)" if size_mb > 0 else f"{height}p",
                 })
             seen = set()
             unique = []
@@ -266,20 +285,20 @@ def get_available_formats(url: str) -> list:
                 if f['height'] not in seen:
                     seen.add(f['height'])
                     unique.append(f)
-            return unique[:5]
+            return unique[:6]
     except Exception as e:
         logging.error(f"get_available_formats error: {e}")
         return []
 
-def download_specific_format(url, output_path, format_id, user_id=None, chat_id=None, msg_id=None):
+def download_video(url, output_path, chat_id=None, msg_id=None, quality_label="Auto"):
     ydl_opts = base_ydl_opts()
     ydl_opts.update({
-        'format': f'{format_id}+ba/b',
+        'format': 'bv*+ba/b',
         'merge_output_format': 'mp4',
         'outtmpl': output_path,
     })
-    if user_id and chat_id and msg_id:
-        ydl_opts['progress_hooks'] = [progress_hook_factory(user_id, chat_id, msg_id)]
+    if chat_id and msg_id:
+        ydl_opts['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -287,7 +306,25 @@ def download_specific_format(url, output_path, format_id, user_id=None, chat_id=
     except yt_dlp.utils.DownloadError as e:
         return False, translate_error(str(e))
     except Exception as e:
-        return False, f"خطأ: {type(e).__name__}"
+        return False, f"Technical error: {type(e).__name__}"
+
+def download_specific_format(url, output_path, format_id, chat_id=None, msg_id=None, quality_label="Custom"):
+    ydl_opts = base_ydl_opts()
+    ydl_opts.update({
+        'format': f'{format_id}+ba/b',
+        'merge_output_format': 'mp4',
+        'outtmpl': output_path,
+    })
+    if chat_id and msg_id:
+        ydl_opts['progress_hooks'] = [progress_hook_factory(chat_id, msg_id, quality_label)]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return True, None
+    except yt_dlp.utils.DownloadError as e:
+        return False, translate_error(str(e))
+    except Exception as e:
+        return False, f"Technical error: {type(e).__name__}"
 
 def download_audio(url, output_path):
     ydl_opts = base_ydl_opts()
@@ -307,11 +344,10 @@ def download_audio(url, output_path):
     except yt_dlp.utils.DownloadError as e:
         return False, translate_error(str(e))
     except Exception as e:
-        return False, f"خطأ: {type(e).__name__}"
+        return False, f"Technical error: {type(e).__name__}"
 
-def download_gallery(url: str, output_dir: str):
+def download_gallery(url, output_dir):
     try:
-        import gallery_dl
         from gallery_dl import job
         os.makedirs(output_dir, exist_ok=True)
         config = {
@@ -354,207 +390,326 @@ def find_output_file(temp_path):
     return None
 
 # ============================================================
-# معالجة الطلب
+# Media info message
+# ============================================================
+def send_media_info(chat_id, info):
+    qualities = info['qualities'][:5]
+    qualities_str = " • ".join(f"{q}p" for q in qualities) if qualities else "Unknown"
+    duration = format_duration(info['duration'])
+    size_str = format_size(info['size_mb']) if info['size_mb'] else "Unknown"
+    audio_str = "Available" if info['has_audio'] else "Not available"
+    platform = info['platform']
+
+    caption = (
+        "MEDIA INFORMATION\n\n"
+        f"Title\n{info['title'][:120]}\n\n"
+        f"Platform\n{platform}\n\n"
+        f"Duration\n{duration}\n\n"
+        f"Available Quality\n{qualities_str}\n\n"
+        f"Audio\n{audio_str}\n\n"
+        f"Size\n{size_str}"
+    )
+
+    if info.get('thumbnail'):
+        try:
+            return bot.send_photo(chat_id, info['thumbnail'], caption=caption)
+        except Exception as e:
+            logging.warning(f"send_photo failed: {e}")
+    return bot.send_message(chat_id, caption)
+
+# ============================================================
+# Process download
 # ============================================================
 def process_download(task: dict):
     chat_id = task['chat_id']
     user_id = task['user_id']
     url = task['url']
-    msg_id = task['msg_id']
 
     temp = f"/tmp/v_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
     temp_dir = f"/tmp/g_{user_id}_{uuid.uuid4().hex[:8]}"
 
+    info_msg = None
+    progress_msg = None
+
     try:
-        ok, err = download_video(url, temp, user_id, chat_id, msg_id)
+        # 1. Fetch info
+        info = get_media_info(url)
+        quality_label = "Auto (Best)"
+        if info and info['qualities']:
+            quality_label = f"{info['qualities'][0]}p"
+
+        # 2. Send info message
+        if info:
+            try:
+                info_msg = send_media_info(chat_id, info)
+            except Exception as e:
+                logging.warning(f"info message error: {e}")
+
+        # 3. Send initial progress message (immediately)
+        try:
+            progress_msg = bot.send_message(
+                chat_id,
+                progress_message_text(0, quality_label, "0.0 MB")
+            )
+        except Exception as e:
+            logging.warning(f"progress message error: {e}")
+
+        # 4. Download with progress updates
+        ok, err = download_video(
+            url, temp,
+            chat_id=chat_id,
+            msg_id=progress_msg.message_id if progress_msg else None,
+            quality_label=quality_label
+        )
+
         if not ok:
+            # Fallback to gallery-dl
             logging.info(f"yt-dlp failed ({err}), trying gallery-dl...")
             ok2, files = download_gallery(url, temp_dir)
             if ok2 and files:
-                send_gallery(chat_id, user_id, url, files, msg_id)
+                # Delete info/progress and send gallery
+                for m in (info_msg, progress_msg):
+                    if m:
+                        try: bot.delete_message(chat_id, m.message_id)
+                        except: pass
+                send_gallery(chat_id, files)
                 return
-            bot.edit_message_text(f"فشل التنزيل.\n\n{err}", chat_id, msg_id)
+            err_text = f"Download failed.\n\n{err}"
+            if progress_msg:
+                try:
+                    bot.edit_message_text(err_text, chat_id, progress_msg.message_id)
+                except: pass
             return
 
         final = find_output_file(temp)
         if not final:
-            bot.edit_message_text("لم يتم إنشاء الملف.", chat_id, msg_id)
+            if progress_msg:
+                try:
+                    bot.edit_message_text("File was not created.", chat_id, progress_msg.message_id)
+                except: pass
             return
 
         size_mb = os.path.getsize(final) / (1024 * 1024)
 
+        # 5. Delete info and progress messages
+        for m in (info_msg, progress_msg):
+            if m:
+                try:
+                    bot.delete_message(chat_id, m.message_id)
+                except: pass
+
         if size_mb > 50:
-            bot.edit_message_text(
-                f"حجم الملف {size_mb:.1f} MB أكبر من حد تيليجرام (50 MB).\n"
-                f"سيتم عرض خيارات جودة أقل.",
-                chat_id, msg_id
+            bot.send_message(
+                chat_id,
+                f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).\n"
+                f"Use the options below to download a lower quality."
             )
-            send_quality_buttons(chat_id, url)
+            send_more_options(chat_id, user_id, url)
             cleanup_file(final)
             return
 
-        with open(final, 'rb') as v:
-            bot.send_video(
-                chat_id, v,
-                caption=f"تم التنزيل بنجاح.\nالحجم: {size_mb:.1f} MB",
-                timeout=180,
-                supports_streaming=True,
-            )
+        # 6. Store URL for "More" button
+        user_pending[user_id] = url
 
-        send_quality_buttons(chat_id, url)
-        bot.delete_message(chat_id, msg_id)
+        # 7. Send video with "More" button only
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("More", callback_data="more"))
+        with open(final, 'rb') as v:
+            bot.send_video(chat_id, v, reply_markup=markup, timeout=180,
+                           supports_streaming=True)
 
     except Exception as e:
         logging.error(f"process_download error: {e}", exc_info=True)
-        try:
-            bot.edit_message_text(
-                f"خطأ تقني: {type(e).__name__}\n{str(e)[:250]}",
-                chat_id, msg_id
-            )
-        except:
-            pass
+        if progress_msg:
+            try:
+                bot.edit_message_text(
+                    f"Technical error: {type(e).__name__}\n{str(e)[:200]}",
+                    chat_id, progress_msg.message_id
+                )
+            except: pass
     finally:
         cleanup_file(temp)
         cleanup_dir(temp_dir)
 
-def send_gallery(chat_id, user_id, url, files, msg_id):
+def send_gallery(chat_id, files):
     try:
-        bot.edit_message_text(f"تم العثور على {len(files)} صورة. جاري الرفع...",
-                              chat_id, msg_id)
         for i, f in enumerate(files[:10]):
             with open(f, 'rb') as img:
-                bot.send_photo(chat_id, img, caption=f"صورة {i+1}/{min(len(files),10)}")
+                bot.send_photo(chat_id, img)
         if len(files) > 10:
-            bot.send_message(chat_id, f"تم إرسال أول 10 صور من أصل {len(files)}.")
-        bot.delete_message(chat_id, msg_id)
+            bot.send_message(chat_id, f"Sent 10 of {len(files)} images.")
     except Exception as e:
         logging.error(f"send_gallery error: {e}")
-        bot.send_message(chat_id, "فشل إرسال الصور.")
 
-def send_quality_buttons(chat_id, url):
+def send_more_options(chat_id, user_id, url):
     formats = get_available_formats(url)
     if not formats:
+        bot.send_message(chat_id, "No format information available.")
         return
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
     for f in formats:
-        cb_data = f"q|{f['id']}|{f['label']}|{url}"
-        if len(cb_data) <= 64:
-            buttons.append(types.InlineKeyboardButton(f['label'], callback_data=cb_data))
-    buttons.append(types.InlineKeyboardButton("MP3 (صوت فقط)", callback_data=f"a|{url}"))
-    if not buttons:
-        return
+        label = f"{f['height']}p"
+        if f['size_mb']:
+            label += f" - {f['size_mb']:.0f}MB"
+        buttons.append(types.InlineKeyboardButton(
+            label, callback_data=f"q|{f['id']}|{f['height']}p"
+        ))
+    buttons.append(types.InlineKeyboardButton("Audio Only (MP3)", callback_data="a"))
     markup.add(*buttons)
-    try:
-        bot.send_message(
-            chat_id,
-            "اختر جودة أخرى أو استخرج الصوت:",
-            reply_markup=markup
-        )
-    except Exception as e:
-        logging.error(f"send_quality_buttons error: {e}")
+    bot.send_message(chat_id, "AVAILABLE OPTIONS", reply_markup=markup)
 
 # ============================================================
-# معالجات الأوامر
+# Handlers
 # ============================================================
 @bot.message_handler(commands=['start', 'help'])
 def welcome(message):
     logging.info(f"Got /start from {message.chat.id}")
     text = (
-        "<b>yt-dlp — أداة تنزيل الوسائط</b>\n\n"
-        "نزّل الفيديوهات والصوتيات من مختلف المنصات بسرعة وبالجودة المتاحة، باستخدام رابط مباشر فقط.\n\n"
-        "يدعم البوت تنزيل المحتوى من منصات متعددة، بما في ذلك:\n\n"
-        "يوتيوب، تيك توك، إنستغرام، فيسبوك، إكس، ريديت، بينتريست، وغيرها.\n\n"
-        "<b>المزايا:</b>\n"
-        "- تنزيل الفيديو بأعلى جودة متاحة.\n"
-        "- استخراج الصوت من الفيديو.\n"
-        "- اختيار صيغة وجودة التنزيل.\n"
-        "- دعم روابط الفيديوهات والمنشورات والمعارض.\n"
-        "- دعم تنزيل الصور من المنصات التي تتيح ذلك.\n"
-        "- معالجة الروابط بسرعة وسهولة.\n"
-        "- واجهة بسيطة دون خطوات معقدة.\n\n"
-        "أرسل رابط المحتوى الآن، وسيتولى <b>yt-dlp</b> تنزيله لك."
+        "<b>yt-dlp</b>\n"
+        "Professional Media Downloading Service\n\n"
+        "Built on the powerful yt-dlp engine, this service provides fast and reliable "
+        "media extraction from a wide range of supported platforms.\n\n"
+        "Download videos, audio, images, posts, and supported media in the available "
+        "quality and formats.\n\n"
+        "<b>FEATURES</b>\n"
+        "• High-quality video and audio extraction\n"
+        "• Multiple formats and quality options\n"
+        "• Support for videos, posts, and media galleries\n"
+        "• Direct file delivery\n"
+        "• Fast and reliable processing\n"
+        "• Broad platform compatibility\n\n"
+        "<b>HOW TO USE</b>\n"
+        "Send a supported media URL and the service will process it automatically."
     )
     bot.reply_to(message, text)
 
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
+@bot.callback_query_handler(func=lambda call: call.data == 'more')
+def handle_more(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    url = user_pending.get(user_id)
+
+    bot.answer_callback_query(call.id)
+
+    if not url:
+        bot.send_message(chat_id, "Session expired. Please send the URL again.")
+        return
+
+    send_more_options(chat_id, user_id, url)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('q|'))
+def handle_quality(call):
     try:
-        data = call.data
-        bot.answer_callback_query(call.id, "جاري المعالجة...")
+        parts = call.data.split('|', 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "Invalid data.")
+            return
+        fmt_id = parts[1]
+        quality_label = parts[2]
 
-        if data.startswith('q|'):
-            parts = data.split('|', 3)
-            if len(parts) < 4:
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        url = user_pending.get(user_id)
+
+        bot.answer_callback_query(call.id, "Processing...")
+
+        if not url:
+            bot.send_message(chat_id, "Session expired.")
+            return
+
+        temp = f"/tmp/q_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
+
+        progress_msg = bot.send_message(
+            chat_id,
+            progress_message_text(0, quality_label, "0.0 MB")
+        )
+
+        try:
+            ok, err = download_specific_format(
+                url, temp, fmt_id,
+                chat_id=chat_id, msg_id=progress_msg.message_id,
+                quality_label=quality_label
+            )
+            if not ok:
+                try:
+                    bot.edit_message_text(f"Download failed.\n\n{err}",
+                                          chat_id, progress_msg.message_id)
+                except: pass
                 return
-            _, fmt_id, label, url = parts
-            chat_id = call.message.chat.id
-            user_id = call.from_user.id
 
-            msg = bot.send_message(chat_id, f"جاري تنزيل الجودة {label}...")
-            temp = f"/tmp/q_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
+            final = find_output_file(temp)
+            if not final:
+                try:
+                    bot.edit_message_text("File was not created.",
+                                          chat_id, progress_msg.message_id)
+                except: pass
+                return
 
-            try:
-                ok, err = download_specific_format(
-                    url, temp, fmt_id, user_id, chat_id, msg.message_id
-                )
-                if not ok:
-                    bot.edit_message_text(f"فشل التنزيل.\n\n{err}",
-                                          chat_id, msg.message_id)
-                    return
+            size_mb = os.path.getsize(final) / (1024 * 1024)
 
-                final = find_output_file(temp)
-                if not final:
-                    bot.edit_message_text("لم يتم إنشاء الملف.",
-                                          chat_id, msg.message_id)
-                    return
+            try: bot.delete_message(chat_id, progress_msg.message_id)
+            except: pass
 
-                size_mb = os.path.getsize(final) / (1024 * 1024)
-                if size_mb > 50:
-                    bot.edit_message_text(
-                        f"الحجم {size_mb:.1f} MB أكبر من حد تيليجرام.",
-                        chat_id, msg.message_id)
-                    return
+            if size_mb > 50:
+                bot.send_message(chat_id,
+                    f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).")
+                return
 
-                with open(final, 'rb') as v:
-                    bot.send_video(chat_id, v,
-                                   caption=f"تم التنزيل ({size_mb:.1f} MB)",
-                                   timeout=180, supports_streaming=True)
-                bot.delete_message(chat_id, msg.message_id)
-            finally:
-                cleanup_file(temp)
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("More", callback_data="more"))
 
-        elif data.startswith('a|'):
-            url = data[2:]
-            chat_id = call.message.chat.id
-            user_id = call.from_user.id
-
-            msg = bot.send_message(chat_id, "جاري استخراج الصوت...")
-            temp = f"/tmp/a_{user_id}_{uuid.uuid4().hex[:8]}"
-
-            try:
-                ok, err = download_audio(url, temp)
-                if not ok:
-                    bot.edit_message_text(f"فشل.\n\n{err}", chat_id, msg.message_id)
-                    return
-
-                final = find_output_file(temp + ".mp3") or find_output_file(temp)
-                if not final:
-                    bot.edit_message_text("لم يتم إنشاء الملف.",
-                                          chat_id, msg.message_id)
-                    return
-
-                with open(final, 'rb') as a:
-                    bot.send_audio(chat_id, a,
-                                   caption="تم استخراج الصوت بنجاح.",
-                                   timeout=180)
-                bot.delete_message(chat_id, msg.message_id)
-            finally:
-                cleanup_file(temp + ".mp3")
-                cleanup_file(temp)
-
+            with open(final, 'rb') as v:
+                bot.send_video(chat_id, v, reply_markup=markup, timeout=180,
+                               supports_streaming=True)
+        finally:
+            cleanup_file(temp)
     except Exception as e:
-        logging.error(f"callback error: {e}", exc_info=True)
+        logging.error(f"handle_quality error: {e}", exc_info=True)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'a')
+def handle_audio(call):
+    try:
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        url = user_pending.get(user_id)
+
+        bot.answer_callback_query(call.id, "Processing...")
+
+        if not url:
+            bot.send_message(chat_id, "Session expired.")
+            return
+
+        progress_msg = bot.send_message(chat_id, "Downloading audio...")
+        temp = f"/tmp/a_{user_id}_{uuid.uuid4().hex[:8]}"
+
+        try:
+            ok, err = download_audio(url, temp)
+            if not ok:
+                try:
+                    bot.edit_message_text(f"Download failed.\n\n{err}",
+                                          chat_id, progress_msg.message_id)
+                except: pass
+                return
+
+            final = find_output_file(temp + ".mp3") or find_output_file(temp)
+            if not final:
+                try:
+                    bot.edit_message_text("File was not created.",
+                                          chat_id, progress_msg.message_id)
+                except: pass
+                return
+
+            try: bot.delete_message(chat_id, progress_msg.message_id)
+            except: pass
+
+            with open(final, 'rb') as a:
+                bot.send_audio(chat_id, a, timeout=180)
+        finally:
+            cleanup_file(temp + ".mp3")
+            cleanup_file(temp)
+    except Exception as e:
+        logging.error(f"handle_audio error: {e}", exc_info=True)
 
 @bot.message_handler(func=lambda m: True)
 def handle(message):
@@ -562,20 +717,21 @@ def handle(message):
     url = message.text.strip()
 
     if not re.match(r'https?://', url):
-        bot.reply_to(message, "الرجاء إرسال رابط صحيح يبدأ بـ http:// أو https://")
+        bot.reply_to(message, "Please send a valid URL starting with http:// or https://")
         return
 
     if not is_allowed_url(url):
-        bot.reply_to(message, "هذا النطاق غير مدعوم من البوت.")
+        bot.reply_to(message, "This domain is not supported.")
         return
 
     allowed, wait = check_rate_limit(message.from_user.id)
     if not allowed:
-        bot.reply_to(message, f"تجاوزت الحد المسموح (5 روابط في الدقيقة).\nحاول بعد {wait} ثانية.")
+        bot.reply_to(message,
+            f"Rate limit exceeded (5 links per minute).\nTry again in {wait} seconds.")
         return
 
     try:
-        msg = bot.reply_to(message, "تم استلام الرابط. جاري المعالجة...")
+        msg = bot.reply_to(message, "Received. Processing...")
         task = {
             'chat_id': message.chat.id,
             'user_id': message.from_user.id,
@@ -584,7 +740,7 @@ def handle(message):
         }
         download_queue.put_nowait(task)
     except queue.Full:
-        bot.reply_to(message, "الخادم مشغول حالياً. حاول بعد قليل.")
+        bot.reply_to(message, "Server busy. Try again shortly.")
 
 # ============================================================
 # Flask
@@ -598,7 +754,7 @@ def index():
     return "Bot is running!", 200
 
 # ============================================================
-# التشغيل
+# Run
 # ============================================================
 def run_bot():
     try:
@@ -606,7 +762,6 @@ def run_bot():
         logging.info("Old webhook removed.")
     except Exception as e:
         logging.warning(f"remove_webhook: {e}")
-
     logging.info("=== Starting polling ===")
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
 
