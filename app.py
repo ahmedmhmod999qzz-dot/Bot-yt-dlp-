@@ -13,6 +13,8 @@ from flask import Flask, jsonify
 import telebot
 from telebot import types
 
+
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -582,7 +584,27 @@ def welcome(message):
         "<b>HOW TO USE</b>\n"
         "Send a supported media URL and the service will process it automatically."
     )
-    bot.reply_to(message, text)
+    PHOTO_FILE_ID = "AgACAgQAAxkBAAM7ar1x_-DZJG9VDd5NRPy2xPtsreoAAs4SaxsCGulR6CNW3Nej7kwBAAMCAAN5AAM9BA"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("⚙ Settings", callback_data="dev"),
+        types.InlineKeyboardButton("❓ Help", callback_data="dev"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("ℹ About", callback_data="dev"),
+        types.InlineKeyboardButton("📊 Status", callback_data="dev"),
+    )
+
+    try:
+        bot.send_photo(message.chat.id, PHOTO_FILE_ID, caption=text, reply_markup=markup)
+    except Exception as e:
+        logging.error(f"send_photo failed: {e}")
+        bot.reply_to(message, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'dev')
+def handle_dev(call):
+    bot.answer_callback_query(call.id, "Under development", show_alert=False)
 
 @bot.callback_query_handler(func=lambda call: call.data == 'more')
 def handle_more(call):
