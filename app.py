@@ -652,9 +652,10 @@ def process_download(task: dict):
             cleanup_file(final)
             return
 
+        # بناء النصوص
         if info:
             details_text = build_compact_caption(info)
-            minimal_text = f"<b>{info['title'][:70]}</b>"
+            minimal_text = f"<b>{escape_html(info['title'][:70])}</b>"
         else:
             details_text = ""
             minimal_text = ""
@@ -667,24 +668,58 @@ def process_download(task: dict):
             types.InlineKeyboardButton("More", callback_data="more"),
         )
 
-        with open(final, 'rb') as v:
-            sent = bot.send_video(
-                chat_id, v,
-                caption=details_text,
-                reply_markup=markup,
-                timeout=180,
-                supports_streaming=True
-            )
+        # محاولة 1: caption + أزرار
+        sent = None
+        try:
+            with open(final, 'rb') as v:
+                sent = bot.send_video(
+                    chat_id, v,
+                    caption=details_text,
+                    reply_markup=markup,
+                    timeout=180,
+                    supports_streaming=True
+                )
+            logging.info(f"[OK] Video sent with caption+buttons, msg_id={sent.message_id}")
+        except Exception as e1:
+            logging.error(f"[FAIL] send with caption+buttons: {e1}")
+            # محاولة 2: أزرار فقط بدون caption
+            try:
+                with open(final, 'rb') as v:
+                    sent = bot.send_video(
+                        chat_id, v,
+                        reply_markup=markup,
+                        timeout=180,
+                        supports_streaming=True
+                    )
+                logging.info(f"[OK] Video sent with buttons only, msg_id={sent.message_id}")
+                if details_text:
+                    try:
+                        bot.send_message(chat_id, details_text, parse_mode="HTML")
+                    except Exception as se:
+                        logging.warning(f"send details msg failed: {se}")
+            except Exception as e2:
+                logging.error(f"[FAIL] send with buttons only: {e2}")
+                # محاولة 3: بدون أي شيء
+                with open(final, 'rb') as v:
+                    sent = bot.send_video(
+                        chat_id, v,
+                        timeout=180,
+                        supports_streaming=True
+                    )
+                logging.info(f"[OK] Video sent without anything, msg_id={sent.message_id}")
 
-        video_details_cache[sent.message_id] = {
-            'details': details_text,
-            'minimal': minimal_text,
-        }
+        # تخزين التفاصيل للتبديل
+        if sent:
+            video_details_cache[sent.message_id] = {
+                'details': details_text,
+                'minimal': minimal_text,
+            }
 
-        threading.Timer(
-            1.0, auto_hide_caption,
-            args=[chat_id, sent.message_id, minimal_text]
-        ).start()
+            # إخفاء تلقائي بعد 5 ثوانٍ
+            threading.Timer(
+                5.0, auto_hide_caption,
+                args=[chat_id, sent.message_id, minimal_text]
+            ).start()
 
     except Exception as e:
         logging.error(f"process_download error: {e}", exc_info=True)
@@ -701,11 +736,14 @@ def process_download(task: dict):
 
 
 def auto_hide_caption(chat_id, msg_id, minimal_text):
-    """إخفاء التفاصيل تلقائياً بعد ثانية."""
+    """إخفاء التفاصيل تلقائياً بعد المهلة."""
     try:
-        bot.edit_message_caption(minimal_text, chat_id, msg_id)
+        bot.edit_message_caption(minimal_text, chat_id, msg_id, parse_mode="HTML")
+        logging.info(f"Caption hidden for message {msg_id}")
     except Exception as e:
-        logging.warning(f"auto_hide_caption failed: {e}")
+        logging.warning(f"auto_hide_caption failed for {msg_id}: {e}")
+
+
 def send_gallery(chat_id, files):
     try:
         for i, f in enumerate(files[:10]):
@@ -715,6 +753,7 @@ def send_gallery(chat_id, files):
             bot.send_message(chat_id, f"Sent 10 of {len(files)} images.")
     except Exception as e:
         logging.error(f"send_gallery error: {e}")
+
 
 def send_more_options(chat_id, user_id, url):
     formats = get_available_formats(url)
@@ -733,7 +772,6 @@ def send_more_options(chat_id, user_id, url):
     buttons.append(types.InlineKeyboardButton("Audio Only (MP3)", callback_data="a"))
     markup.add(*buttons)
     bot.send_message(chat_id, "AVAILABLE OPTIONS", reply_markup=markup)
-
 # ============================================================
 # Handlers
 # ============================================================
