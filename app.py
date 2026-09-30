@@ -19,14 +19,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def download_video(url, output_path):
     command = [
-        "yt-dlp",
-        "-f", "bv*+ba/b",
+        "yt-dlp", "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
-        "--no-playlist",
-        "--retries", "10",
-        "-N", "4",
-        "-o", output_path,
-        url
+        "--no-playlist", "--retries", "10", "-N", "4",
+        "-o", output_path, url
     ]
     try:
         result = subprocess.run(
@@ -37,18 +33,20 @@ def download_video(url, output_path):
             return False, (result.stderr or "Unknown error")[:500]
         return True, None
     except subprocess.TimeoutExpired:
-        return False, "انتهت المهلة (10 دقائق)"
+        return False, "انتهت المهلة"
     except Exception as e:
         return False, str(e)
 
 
 @bot.message_handler(commands=['start', 'help'])
 def welcome(message):
+    logging.info(f"Got /start from {message.chat.id}")
     bot.reply_to(message, "👋 أرسل لي رابط فيديو وسأنزّله لك.\n⚠️ الحد الأقصى: 50MB")
 
 
 @bot.message_handler(func=lambda m: True)
 def handle(message):
+    logging.info(f"Got message: {message.text}")
     url = message.text.strip()
     if not re.match(r'https?://', url):
         bot.reply_to(message, "❌ أرسل رابطاً صحيحاً.")
@@ -72,7 +70,7 @@ def handle(message):
         size_mb = os.path.getsize(temp) / (1024 * 1024)
         if size_mb > 50:
             bot.edit_message_text(
-                f"⚠️ الحجم {size_mb:.1f}MB أكبر من حد تيليجرام (50MB).",
+                f"⚠️ الحجم {size_mb:.1f}MB أكبر من 50MB.",
                 message.chat.id, msg.message_id)
             return
 
@@ -115,11 +113,16 @@ def run_bot():
     except Exception as e:
         logging.warning(f"remove_webhook: {e}")
 
-    logging.info("Starting polling...")
+    logging.info("=== Starting polling ===")
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
 
 
+# ✅ تشغيل البوت فوراً عند استيراد الملف (مهم لـ gunicorn)
+logging.info("=== Bot thread starting (module level) ===")
+_bot_thread = threading.Thread(target=run_bot, daemon=True)
+_bot_thread.start()
+
+
 if __name__ == '__main__':
-    threading.Thread(target=run_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
