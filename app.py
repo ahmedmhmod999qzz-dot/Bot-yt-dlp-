@@ -742,6 +742,11 @@ def handle(message):
     except queue.Full:
         bot.reply_to(message, "Server busy. Try again shortly.")
 
+@bot.message_handler(content_types=['photo'])
+def get_photo_id(message):
+    """مؤقت: استخراج file_id للصورة."""
+    file_id = message.photo[-1].file_id
+    bot.reply_to(message, f"<code>{file_id}</code>")
 # ============================================================
 # Flask
 # ============================================================
