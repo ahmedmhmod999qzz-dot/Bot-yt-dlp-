@@ -3,3 +3,4 @@ pyTelegramBotAPI==4.17.0
 gunicorn==22.0.0
 yt-dlp
 imageio-ffmpeg
+curl_cffi
