@@ -85,6 +85,7 @@ def check_rate_limit(user_id: int):
 # ============================================================
 download_queue = queue.Queue(maxsize=100)
 user_pending = {}          # {user_id: url} for "More" button
+video_details_cache = {}   # {message_id: {'details': ..., 'minimal': ...}}
 progress_lock = threading.Lock()
 last_progress_update = {}  # {msg_id: timestamp}
 
@@ -121,6 +122,23 @@ def format_size(mb: float) -> str:
     if mb >= 1024:
         return f"{mb/1024:.2f} GB"
     return f"{mb:.1f} MB"
+
+def build_compact_caption(info):
+    """بناء Caption مختصر ومرتب لتفاصيل الفيديو."""
+    qualities = info['qualities'][:5]
+    qualities_str = " • ".join(f"{q}p" for q in qualities) if qualities else "Unknown"
+    duration = format_duration(info['duration'])
+    size_str = format_size(info['size_mb']) if info['size_mb'] else "Unknown"
+    audio_str = "Yes" if info['has_audio'] else "No"
+    platform = info['platform']
+    title = info['title'][:70]
+
+    return (
+        f"<b>{title}</b>\n"
+        f"{platform}  •  {duration}  •  {size_str}\n"
+        f"Quality: {qualities_str}\n"
+        f"Audio: {audio_str}"
+    )
 
 def make_blocks_bar(percent: float, length: int = 16) -> str:
     filled = int(length * max(0, min(100, percent)) / 100)
@@ -605,6 +623,36 @@ def welcome(message):
 @bot.callback_query_handler(func=lambda call: call.data == 'dev')
 def handle_dev(call):
     bot.answer_callback_query(call.id, "Under development", show_alert=False)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'toggle_details')
+def handle_toggle_details(call):
+    msg_id = call.message.message_id
+    chat_id = call.message.chat.id
+    cache = video_details_cache.get(msg_id)
+
+    if not cache:
+        bot.answer_callback_query(call.id, "Details not available")
+        return
+
+    current_caption = (call.message.caption or "").strip()
+    details = (cache['details'] or "").strip()
+
+    if current_caption == details:
+        # Hide now
+        try:
+            bot.edit_message_caption(cache['minimal'], chat_id, msg_id)
+            bot.answer_callback_query(call.id, "Details hidden")
+        except Exception as e:
+            logging.error(f"hide caption failed: {e}")
+            bot.answer_callback_query(call.id, "Failed")
+    else:
+        # Show
+        try:
+            bot.edit_message_caption(cache['details'], chat_id, msg_id)
+            bot.answer_callback_query(call.id, "Details shown")
+        except Exception as e:
+            logging.error(f"show caption failed: {e}")
+            bot.answer_callback_query(call.id, "Failed")
 
 @bot.callback_query_handler(func=lambda call: call.data == 'more')
 def handle_more(call):
