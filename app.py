@@ -1,9 +1,10 @@
 import os
 import re
 import logging
-import subprocess
 import threading
 import uuid
+import yt_dlp
+import imageio_ffmpeg
 from flask import Flask, jsonify
 import telebot
 
@@ -16,26 +17,31 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# مسار ffmpeg المرفق مع imageio-ffmpeg
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+logging.info(f"FFmpeg path: {FFMPEG_PATH}")
+
 
 def download_video(url, output_path):
-    command = [
-        "yt-dlp", "-f", "bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "--no-playlist", "--retries", "10", "-N", "4",
-        "-o", output_path, url
-    ]
+    """تنزيل الفيديو بأعلى جودة باستخدام yt-dlp Python API."""
+    ydl_opts = {
+        'format': 'bv*+ba/b',
+        'merge_output_format': 'mp4',
+        'outtmpl': output_path,
+        'noplaylist': True,
+        'retries': 10,
+        'fragment_retries': 10,
+        'concurrent_fragment_downloads': 4,
+        'ffmpeg_location': FFMPEG_PATH,
+        'quiet': True,
+        'no_warnings': True,
+    }
     try:
-        result = subprocess.run(
-            command, capture_output=True, text=True,
-            timeout=600, stdin=subprocess.DEVNULL
-        )
-        if result.returncode != 0:
-            return False, (result.stderr or "Unknown error")[:500]
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
         return True, None
-    except subprocess.TimeoutExpired:
-        return False, "انتهت المهلة"
     except Exception as e:
-        return False, str(e)
+        return False, str(e)[:500]
 
 
 @bot.message_handler(commands=['start', 'help'])
@@ -62,10 +68,21 @@ def handle(message):
                                   message.chat.id, msg.message_id)
             return
 
+        # البحث عن الملف الناتج (yt-dlp قد يضيف امتداداً مختلفاً)
         if not os.path.exists(temp):
-            bot.edit_message_text("❌ لم يتم إنشاء الملف.",
-                                  message.chat.id, msg.message_id)
-            return
+            # ابحث عن أي ملف يبدأ بنفس الاسم
+            base = temp.rsplit('.', 1)[0]
+            found = None
+            for f in os.listdir('/tmp'):
+                if f.startswith(os.path.basename(base)):
+                    found = f"/tmp/{f}"
+                    break
+            if found:
+                temp = found
+            else:
+                bot.edit_message_text("❌ لم يتم إنشاء الملف.",
+                                      message.chat.id, msg.message_id)
+                return
 
         size_mb = os.path.getsize(temp) / (1024 * 1024)
         if size_mb > 50:
@@ -117,10 +134,8 @@ def run_bot():
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
 
 
-# ✅ تشغيل البوت فوراً عند استيراد الملف (مهم لـ gunicorn)
-logging.info("=== Bot thread starting (module level) ===")
-_bot_thread = threading.Thread(target=run_bot, daemon=True)
-_bot_thread.start()
+logging.info("=== Bot thread starting ===")
+threading.Thread(target=run_bot, daemon=True).start()
 
 
 if __name__ == '__main__':
