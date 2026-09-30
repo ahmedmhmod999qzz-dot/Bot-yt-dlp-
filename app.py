@@ -448,24 +448,15 @@ def process_download(task: dict):
     temp = f"/tmp/v_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
     temp_dir = f"/tmp/g_{user_id}_{uuid.uuid4().hex[:8]}"
 
-    info_msg = None
+    info = None
     progress_msg = None
 
     try:
-        # 1. Fetch info
         info = get_media_info(url)
         quality_label = "Auto (Best)"
         if info and info['qualities']:
             quality_label = f"{info['qualities'][0]}p"
 
-        # 2. Send info message
-        if info:
-            try:
-                info_msg = send_media_info(chat_id, info)
-            except Exception as e:
-                logging.warning(f"info message error: {e}")
-
-        # 3. Send initial progress message (immediately)
         try:
             progress_msg = bot.send_message(
                 chat_id,
@@ -474,7 +465,6 @@ def process_download(task: dict):
         except Exception as e:
             logging.warning(f"progress message error: {e}")
 
-        # 4. Download with progress updates
         ok, err = download_video(
             url, temp,
             chat_id=chat_id,
@@ -483,21 +473,18 @@ def process_download(task: dict):
         )
 
         if not ok:
-            # Fallback to gallery-dl
             logging.info(f"yt-dlp failed ({err}), trying gallery-dl...")
             ok2, files = download_gallery(url, temp_dir)
             if ok2 and files:
-                # Delete info/progress and send gallery
-                for m in (info_msg, progress_msg):
-                    if m:
-                        try: bot.delete_message(chat_id, m.message_id)
-                        except: pass
+                if progress_msg:
+                    try: bot.delete_message(chat_id, progress_msg.message_id)
+                    except: pass
                 send_gallery(chat_id, files)
                 return
-            err_text = f"Download failed.\n\n{err}"
             if progress_msg:
                 try:
-                    bot.edit_message_text(err_text, chat_id, progress_msg.message_id)
+                    bot.edit_message_text(f"Download failed.\n\n{err}",
+                                          chat_id, progress_msg.message_id)
                 except: pass
             return
 
@@ -505,18 +492,16 @@ def process_download(task: dict):
         if not final:
             if progress_msg:
                 try:
-                    bot.edit_message_text("File was not created.", chat_id, progress_msg.message_id)
+                    bot.edit_message_text("File was not created.",
+                                          chat_id, progress_msg.message_id)
                 except: pass
             return
 
         size_mb = os.path.getsize(final) / (1024 * 1024)
 
-        # 5. Delete info and progress messages
-        for m in (info_msg, progress_msg):
-            if m:
-                try:
-                    bot.delete_message(chat_id, m.message_id)
-                except: pass
+        if progress_msg:
+            try: bot.delete_message(chat_id, progress_msg.message_id)
+            except: pass
 
         if size_mb > 50:
             bot.send_message(
@@ -524,19 +509,44 @@ def process_download(task: dict):
                 f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).\n"
                 f"Use the options below to download a lower quality."
             )
+            user_pending[user_id] = url
             send_more_options(chat_id, user_id, url)
             cleanup_file(final)
             return
 
-        # 6. Store URL for "More" button
+        if info:
+            details_text = build_compact_caption(info)
+            minimal_text = f"<b>{info['title'][:70]}</b>"
+        else:
+            details_text = ""
+            minimal_text = ""
+
         user_pending[user_id] = url
 
-        # 7. Send video with "More" button only
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("More", callback_data="more"))
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("Details", callback_data="toggle_details"),
+            types.InlineKeyboardButton("More", callback_data="more"),
+        )
+
         with open(final, 'rb') as v:
-            bot.send_video(chat_id, v, reply_markup=markup, timeout=180,
-                           supports_streaming=True)
+            sent = bot.send_video(
+                chat_id, v,
+                caption=details_text,
+                reply_markup=markup,
+                timeout=180,
+                supports_streaming=True
+            )
+
+        video_details_cache[sent.message_id] = {
+            'details': details_text,
+            'minimal': minimal_text,
+        }
+
+        threading.Timer(
+            1.0, auto_hide_caption,
+            args=[chat_id, sent.message_id, minimal_text]
+        ).start()
 
     except Exception as e:
         logging.error(f"process_download error: {e}", exc_info=True)
@@ -551,6 +561,13 @@ def process_download(task: dict):
         cleanup_file(temp)
         cleanup_dir(temp_dir)
 
+
+def auto_hide_caption(chat_id, msg_id, minimal_text):
+    """إخفاء التفاصيل تلقائياً بعد ثانية."""
+    try:
+        bot.edit_message_caption(minimal_text, chat_id, msg_id)
+    except Exception as e:
+        logging.warning(f"auto_hide_caption failed: {e}")
 def send_gallery(chat_id, files):
     try:
         for i, f in enumerate(files[:10]):
