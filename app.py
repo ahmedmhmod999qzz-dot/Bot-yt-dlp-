@@ -524,23 +524,43 @@ def download_audio(url, output_path):
         return False, f"Technical error: {type(e).__name__}"
 
 def download_gallery(url, output_dir):
+    """تنزيل الصور باستخدام gallery-dl مع إعدادات محسّنة."""
     try:
         from gallery_dl import job
         os.makedirs(output_dir, exist_ok=True)
+        
+        # إعدادات محسّنة لـ gallery-dl
         config = {
             'base-directory': output_dir,
             'filename': '{num:03d}_{filename}.{extension}',
             'quiet': True,
+            'sleep-request': 1.0,
+            'retries': 3,
+            'timeout': 30,
+            'verify': True,
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         }
+        
+        # تشغيل التنزيل
         j = job.DownloadJob(url, config=config)
         j.run()
-        files = sorted([f for f in os.listdir(output_dir)
-                        if os.path.isfile(os.path.join(output_dir, f))])
+        
+        # جمع الملفات
+        files = sorted([
+            f for f in os.listdir(output_dir)
+            if os.path.isfile(os.path.join(output_dir, f))
+        ])
+        
+        if not files:
+            logging.warning(f"gallery-dl: no files downloaded from {url}")
+            return False, []
+        
+        logging.info(f"gallery-dl: downloaded {len(files)} files")
         return True, [os.path.join(output_dir, f) for f in files]
+        
     except Exception as e:
-        logging.error(f"gallery-dl error: {e}")
+        logging.error(f"gallery-dl error: {e}", exc_info=True)
         return False, []
-
 def cleanup_file(path):
     if path and os.path.exists(path):
         try:
@@ -605,60 +625,25 @@ def process_download(task: dict):
     temp = f"/tmp/v_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
     temp_dir = f"/tmp/g_{user_id}_{uuid.uuid4().hex[:8]}"
 
-    info = None
-    progress_msg = None
-
     try:
-        info = get_media_info(url)
-        quality_label = "Auto (Best)"
-        if info and info['qualities']:
-            quality_label = f"{info['qualities'][0]}p"
-
-        try:
-            progress_msg = bot.send_message(
-                chat_id,
-                progress_message_text(0, quality_label, "0.0 MB")
-            )
-        except Exception as e:
-            logging.warning(f"progress message error: {e}")
-
-        ok, err = download_video(
-            url, temp,
-            chat_id=chat_id,
-            msg_id=progress_msg.message_id if progress_msg else None,
-            quality_label=quality_label
-        )
+        # تنزيل بدون شريط تقدم
+        ok, err = download_video(url, temp)
 
         if not ok:
             logging.info(f"yt-dlp failed ({err}), trying gallery-dl...")
             ok2, files = download_gallery(url, temp_dir)
             if ok2 and files:
-                if progress_msg:
-                    try: bot.delete_message(chat_id, progress_msg.message_id)
-                    except: pass
                 send_gallery(chat_id, files)
                 return
-            if progress_msg:
-                try:
-                    bot.edit_message_text(f"Download failed.\n\n{err}",
-                                          chat_id, progress_msg.message_id)
-                except: pass
+            bot.send_message(chat_id, f"Download failed.\n\n{err}")
             return
 
         final = find_output_file(temp)
         if not final:
-            if progress_msg:
-                try:
-                    bot.edit_message_text("File was not created.",
-                                          chat_id, progress_msg.message_id)
-                except: pass
+            bot.send_message(chat_id, "File was not created.")
             return
 
         size_mb = os.path.getsize(final) / (1024 * 1024)
-
-        if progress_msg:
-            try: bot.delete_message(chat_id, progress_msg.message_id)
-            except: pass
 
         if size_mb > 50:
             bot.send_message(
@@ -671,88 +656,29 @@ def process_download(task: dict):
             cleanup_file(final)
             return
 
-        # بناء النصوص
-        if info:
-            details_text = build_compact_caption(info)
-            minimal_text = f"<b>{escape_html(info['title'][:70])}</b>"
-        else:
-            details_text = ""
-            minimal_text = ""
-
         user_pending[user_id] = url
 
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton("Details", callback_data="toggle_details"),
-            types.InlineKeyboardButton("More", callback_data="more"),
-        )
+        # زر More فقط
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("More", callback_data="more"))
 
-        # محاولة 1: caption + أزرار
-        sent = None
-        try:
-            with open(final, 'rb') as v:
-                sent = bot.send_video(
-                    chat_id, v,
-                    caption=details_text,
-                    reply_markup=markup,
-                    timeout=180,
-                    supports_streaming=True
-                )
-            logging.info(f"[OK] Video sent with caption+buttons, msg_id={sent.message_id}")
-        except Exception as e1:
-            logging.error(f"[FAIL] send with caption+buttons: {e1}")
-            # محاولة 2: أزرار فقط بدون caption
-            try:
-                with open(final, 'rb') as v:
-                    sent = bot.send_video(
-                        chat_id, v,
-                        reply_markup=markup,
-                        timeout=180,
-                        supports_streaming=True
-                    )
-                logging.info(f"[OK] Video sent with buttons only, msg_id={sent.message_id}")
-                if details_text:
-                    try:
-                        bot.send_message(chat_id, details_text, parse_mode="HTML")
-                    except Exception as se:
-                        logging.warning(f"send details msg failed: {se}")
-            except Exception as e2:
-                logging.error(f"[FAIL] send with buttons only: {e2}")
-                # محاولة 3: بدون أي شيء
-                with open(final, 'rb') as v:
-                    sent = bot.send_video(
-                        chat_id, v,
-                        timeout=180,
-                        supports_streaming=True
-                    )
-                logging.info(f"[OK] Video sent without anything, msg_id={sent.message_id}")
-
-        # تخزين التفاصيل للتبديل
-        if sent:
-            video_details_cache[sent.message_id] = {
-                'details': details_text,
-                'minimal': minimal_text,
-            }
-
-            # إخفاء تلقائي بعد 5 ثوانٍ
-            threading.Timer(
-                5.0, auto_hide_caption,
-                args=[chat_id, sent.message_id, minimal_text]
-            ).start()
+        with open(final, 'rb') as v:
+            bot.send_video(
+                chat_id, v,
+                reply_markup=markup,
+                timeout=180,
+                supports_streaming=True
+            )
 
     except Exception as e:
         logging.error(f"process_download error: {e}", exc_info=True)
-        if progress_msg:
-            try:
-                bot.edit_message_text(
-                    f"Technical error: {type(e).__name__}\n{str(e)[:200]}",
-                    chat_id, progress_msg.message_id
-                )
-            except: pass
+        try:
+            bot.send_message(chat_id, f"Technical error: {type(e).__name__}")
+        except:
+            pass
     finally:
         cleanup_file(temp)
         cleanup_dir(temp_dir)
-
 
 def auto_hide_caption(chat_id, msg_id, minimal_text):
     """إخفاء التفاصيل مع الحفاظ على الأزرار."""
@@ -774,16 +700,42 @@ def auto_hide_caption(chat_id, msg_id, minimal_text):
         logging.warning(f"auto_hide_caption failed: {e}")
 
 def send_gallery(chat_id, files):
-    try:
-        for i, f in enumerate(files[:10]):
+    """إرسال الصور مع دعم صيغ متعددة."""
+    if not files:
+        bot.send_message(chat_id, "No images found.")
+        return
+    
+    # فلترة: صور فقط (لا فيديوهات)
+    image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
+    video_exts = ('.mp4', '.webm', '.mov', '.mkv')
+    
+    images = [f for f in files if f.lower().endswith(image_exts)]
+    videos = [f for f in files if f.lower().endswith(video_exts)]
+    others = [f for f in files if f not in images and f not in videos]
+    
+    # إرسال الصور
+    sent_count = 0
+    for f in images[:10]:
+        try:
             with open(f, 'rb') as img:
-                bot.send_photo(chat_id, img)
-        if len(files) > 10:
-            bot.send_message(chat_id, f"Sent 10 of {len(files)} images.")
-    except Exception as e:
-        logging.error(f"send_gallery error: {e}")
-
-
+                bot.send_photo(chat_id, img, timeout=120)
+            sent_count += 1
+        except Exception as e:
+            logging.error(f"send_photo failed: {e}")
+    
+    # إرسال فيديوهات إن وجدت (من ضمن gallery-dl)
+    for f in videos[:3]:
+        try:
+            with open(f, 'rb') as v:
+                bot.send_video(chat_id, v, timeout=180, supports_streaming=True)
+        except Exception as e:
+            logging.error(f"send_video from gallery failed: {e}")
+    
+    if len(images) > 10:
+        bot.send_message(chat_id, f"Sent 10 of {len(images)} images.")
+    
+    if sent_count == 0 and not videos:
+        bot.send_message(chat_id, "No viewable media found.")
 def send_more_options(chat_id, user_id, url):
     formats = get_available_formats(url)
     if not formats:
