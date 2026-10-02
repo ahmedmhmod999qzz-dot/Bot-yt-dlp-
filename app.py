@@ -74,6 +74,19 @@ RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 5
 
 
+def _cleanup_user_requests():
+    """✅ إصلاح #5: إزالة المستخدمين القدامى من user_requests لتجنب تسريب الذاكرة."""
+    now = time.time()
+    stale = [
+        uid for uid, times in user_requests.items()
+        if not times or (now - max(times)) > RATE_LIMIT_WINDOW
+    ]
+    for uid in stale:
+        user_requests.pop(uid, None)
+    if stale:
+        logging.info(f"Cleaned {len(stale)} stale rate-limit entries")
+
+
 def check_rate_limit(user_id: int):
     now = time.time()
     user_requests[user_id] = [t for t in user_requests[user_id] if now - t < RATE_LIMIT_WINDOW]
@@ -88,9 +101,9 @@ def check_rate_limit(user_id: int):
 # Queue and shared state
 # ============================================================
 download_queue = queue.Queue(maxsize=100)
+# ✅ إصلاح #9: تخزين التنسيقات في user_pending لتجنب طلب شبكة متكرر
 user_pending = {}  # {user_id: {'url': str, 'ts': float, 'formats': list|None}}
 USER_PENDING_TTL = 3600  # ساعة واحدة
-_cleanup_counter = 0
 
 
 def _cleanup_user_pending():
@@ -123,6 +136,7 @@ def _get_user_pending(user_id: int):
 
 
 def _get_user_formats(user_id: int):
+    """✅ إصلاح #9: استرجاع التنسيقات المخزنة مؤقتاً."""
     data = user_pending.get(user_id)
     if not data:
         return None
@@ -130,7 +144,7 @@ def _get_user_formats(user_id: int):
 
 
 def _background_fetch_formats(user_id: int, url: str):
-    """جلب التنسيقات في الخلفية بعد إرسال الفيديو."""
+    """✅ إصلاح #9: جلب التنسيقات في الخلفية بعد إرسال الفيديو لتجهيز زر More."""
     try:
         formats = get_available_formats(url)
         if formats and user_id in user_pending:
@@ -140,23 +154,32 @@ def _background_fetch_formats(user_id: int, url: str):
         logging.warning(f"background fetch formats failed: {e}")
 
 
-def download_worker():
-    global _cleanup_counter
+def download_worker(worker_id: int):
+    """✅ إصلاح #8: عامل قابل للتكرار، يعمل في خيط منفصل."""
+    logging.info(f"Worker #{worker_id} started")
     while True:
         try:
             task = download_queue.get(timeout=5)
             if task is None:
                 break
-            # ✅ تنظيف كل 50 مهمة فقط لتسريع الأداء
-            _cleanup_counter += 1
-            if _cleanup_counter % 50 == 0:
-                _cleanup_user_pending()
+            logging.info(f"Worker #{worker_id} processing: {task.get('url', '')[:80]}")
             process_download(task)
             download_queue.task_done()
         except queue.Empty:
             continue
         except Exception as e:
-            logging.error(f"Worker error: {e}", exc_info=True)
+            logging.error(f"Worker #{worker_id} error: {e}", exc_info=True)
+
+
+def _cleanup_loop():
+    """✅ إصلاح #5: تنظيف دوري لـ user_pending و user_requests كل 10 دقائق."""
+    while True:
+        try:
+            time.sleep(600)  # 10 دقائق
+            _cleanup_user_pending()
+            _cleanup_user_requests()
+        except Exception as e:
+            logging.error(f"cleanup loop error: {e}", exc_info=True)
 
 
 # ============================================================
@@ -184,7 +207,6 @@ def base_ydl_opts():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
-        # ✅ إصلاح يوتيوب: تجربة عملاء متعددين لتجاوز حظر مراكز البيانات
         'extractor_args': {
             'youtube': {
                 'player_client': ['ios', 'android', 'tv_embedded', 'web_safari', 'mweb'],
@@ -272,7 +294,6 @@ def download_video(url, output_path):
     is_tiktok = 'tiktok.com' in url
     is_youtube = 'youtube.com' in url or 'youtu.be' in url
 
-    # تحويل روابط تويتر إلى fxtwitter (يعمل بشكل أفضل مع yt-dlp)
     if is_twitter:
         url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
         logging.info(f"Twitter URL converted: {url}")
@@ -303,7 +324,7 @@ def download_video(url, output_path):
         })
         attempts.append(('twitter_legacy', original_url, opts2))
 
-    # ✅ محاولة يوتيوب بديلة 1: tv_embedded (يعمل بدون po_token)
+    # محاولة 3: يوتيوب tv_embedded
     if is_youtube:
         opts_yt1 = base_ydl_opts()
         opts_yt1.update({
@@ -319,7 +340,7 @@ def download_video(url, output_path):
         })
         attempts.append(('youtube_tv_embedded', original_url, opts_yt1))
 
-    # ✅ محاولة يوتيوب بديلة 2: mweb (بدون po_token)
+    # محاولة 4: يوتيوب mweb
     if is_youtube:
         opts_yt2 = base_ydl_opts()
         opts_yt2.update({
@@ -334,7 +355,7 @@ def download_video(url, output_path):
         })
         attempts.append(('youtube_mweb', original_url, opts_yt2))
 
-    # محاولة عامة: أفضل ملف مدمج
+    # محاولة 5: أفضل ملف مدمج (عام)
     opts3 = base_ydl_opts()
     opts3.update({
         'format': 'b',
@@ -370,7 +391,6 @@ def download_specific_format(url, output_path, format_id, height=None):
 
     attempts = []
 
-    # محاولة 1: الجودة المطلوبة + أفضل صوت
     opts1 = base_ydl_opts()
     opts1.update({
         'format': f'{format_id}+ba/b',
@@ -379,7 +399,6 @@ def download_specific_format(url, output_path, format_id, height=None):
     })
     attempts.append(('specific+audio', url, opts1))
 
-    # محاولة 2: الجودة المطلوبة فقط
     opts2 = base_ydl_opts()
     opts2.update({
         'format': format_id,
@@ -387,7 +406,6 @@ def download_specific_format(url, output_path, format_id, height=None):
     })
     attempts.append(('specific_only', original_url, opts2))
 
-    # محاولة 3: أعلى جودة أقل من أو تساوي الارتفاع المطلوب
     if height and str(height).isdigit():
         opts3 = base_ydl_opts()
         opts3.update({
@@ -556,7 +574,7 @@ def process_download(task: dict):
                 supports_streaming=True
             )
 
-        # ✅ جلب التنسيقات في الخلفية لتسريع زر More
+        # ✅ إصلاح #9: جلب التنسيقات في الخلفية لتفعيل زر More فوراً
         threading.Thread(
             target=_background_fetch_formats,
             args=(user_id, url),
@@ -612,7 +630,7 @@ def send_gallery(chat_id, files):
 
 
 def send_more_options(chat_id, user_id, url):
-    # ✅ استخدام التنسيقات المخزنة مؤقتاً إذا متوفرة
+    """✅ إصلاح #9: استخدام التنسيقات المخزنة مؤقتاً إن وُجدت."""
     formats = _get_user_formats(user_id)
     if not formats:
         formats = get_available_formats(url)
@@ -831,7 +849,10 @@ def handle(message):
 # ============================================================
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "queue_size": download_queue.qsize()}), 200
+    return jsonify({
+        "status": "ok",
+        "queue_size": download_queue.qsize(),
+    }), 200
 
 
 @app.route('/')
@@ -852,8 +873,13 @@ def run_bot():
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
 
 
-threading.Thread(target=download_worker, daemon=True).start()
+# ✅ إصلاح #8: 3 عمال متوازيين بدلاً من عامل واحد
+NUM_WORKERS = 3
+for i in range(NUM_WORKERS):
+    threading.Thread(target=download_worker, args=(i + 1,), daemon=True).start()
+
 threading.Thread(target=run_bot, daemon=True).start()
+threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
