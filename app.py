@@ -75,7 +75,6 @@ RATE_LIMIT_MAX = 5
 
 
 def _cleanup_user_requests():
-    """✅ إصلاح #5: إزالة المستخدمين القدامى من user_requests لتجنب تسريب الذاكرة."""
     now = time.time()
     stale = [
         uid for uid, times in user_requests.items()
@@ -101,9 +100,8 @@ def check_rate_limit(user_id: int):
 # Queue and shared state
 # ============================================================
 download_queue = queue.Queue(maxsize=100)
-# ✅ إصلاح #9: تخزين التنسيقات في user_pending لتجنب طلب شبكة متكرر
 user_pending = {}  # {user_id: {'url': str, 'ts': float, 'formats': list|None}}
-USER_PENDING_TTL = 3600  # ساعة واحدة
+USER_PENDING_TTL = 3600
 
 
 def _cleanup_user_pending():
@@ -136,7 +134,6 @@ def _get_user_pending(user_id: int):
 
 
 def _get_user_formats(user_id: int):
-    """✅ إصلاح #9: استرجاع التنسيقات المخزنة مؤقتاً."""
     data = user_pending.get(user_id)
     if not data:
         return None
@@ -144,7 +141,6 @@ def _get_user_formats(user_id: int):
 
 
 def _background_fetch_formats(user_id: int, url: str):
-    """✅ إصلاح #9: جلب التنسيقات في الخلفية بعد إرسال الفيديو لتجهيز زر More."""
     try:
         formats = get_available_formats(url)
         if formats and user_id in user_pending:
@@ -155,7 +151,6 @@ def _background_fetch_formats(user_id: int, url: str):
 
 
 def download_worker(worker_id: int):
-    """✅ إصلاح #8: عامل قابل للتكرار، يعمل في خيط منفصل."""
     logging.info(f"Worker #{worker_id} started")
     while True:
         try:
@@ -172,10 +167,9 @@ def download_worker(worker_id: int):
 
 
 def _cleanup_loop():
-    """✅ إصلاح #5: تنظيف دوري لـ user_pending و user_requests كل 10 دقائق."""
     while True:
         try:
-            time.sleep(600)  # 10 دقائق
+            time.sleep(600)
             _cleanup_user_pending()
             _cleanup_user_requests()
         except Exception as e:
@@ -243,6 +237,8 @@ def translate_error(err: str) -> str:
         return "Unable to extract video data."
     if 'Failed to extract any player response' in err:
         return "YouTube blocked this request from the server. Try again later."
+    if 'no video' in err.lower() or 'There is no video' in err:
+        return "No video found in this post (may be images only)."
     if 'Video unavailable' in err:
         return "Video unavailable."
     if 'ffmpeg' in err.lower():
@@ -251,6 +247,9 @@ def translate_error(err: str) -> str:
     return f"Download failed: {clean[:200]}"
 
 
+# ============================================================
+# ✅ إصلاح #1: get_available_formats — الجودات الحقيقية والحجم الفعلي
+# ============================================================
 def get_available_formats(url: str) -> list:
     ydl_opts = base_ydl_opts()
     try:
@@ -258,42 +257,63 @@ def get_available_formats(url: str) -> list:
             info = ydl.extract_info(url, download=False)
             if 'entries' in info:
                 info = info['entries'][0]
+
+            duration = info.get('duration') or 0
             formats = []
+
             for f in info.get('formats', []):
+                # تجاهل التنسيقات التي لا تحتوي على فيديو
                 if f.get('vcodec') == 'none':
                     continue
                 height = f.get('height')
                 if not height:
                     continue
-                filesize = f.get('filesize') or f.get('filesize_approx') or 0
-                size_mb = filesize / (1024 * 1024)
+
+                # ✅ حساب الحجم الفعلي: filesize → filesize_approx → tbr × duration
+                filesize = f.get('filesize') or f.get('filesize_approx')
+                if not filesize and f.get('tbr') and duration:
+                    # tbr بالكيلوبت/ثانية
+                    filesize = (f['tbr'] * 1000 / 8) * duration
+                elif not filesize and f.get('vbr') and duration:
+                    # vbr (bitrate الفيديو) + صوت تقريبي
+                    filesize = ((f['vbr'] + 128) * 1000 / 8) * duration
+
+                size_mb = filesize / (1024 * 1024) if filesize else 0
+
                 formats.append({
                     'id': f.get('format_id', ''),
                     'height': height,
                     'size_mb': round(size_mb, 1),
+                    'ext': f.get('ext', 'mp4'),
+                    'fps': f.get('fps'),
+                    'tbr': f.get('tbr') or 0,
                 })
-            seen = set()
-            unique = []
-            for f in sorted(formats, key=lambda x: x['height'], reverse=True):
-                if f['height'] not in seen:
-                    seen.add(f['height'])
-                    unique.append(f)
-            return unique[:6]
+
+            # إزالة التكرار حسب الدقة، مع الاحتفاظ بأعلى bitrate
+            seen = {}
+            for f in formats:
+                h = f['height']
+                if h not in seen or f['tbr'] > seen[h]['tbr']:
+                    seen[h] = f
+
+            unique = sorted(seen.values(), key=lambda x: x['height'], reverse=True)
+            logging.info(f"Found {len(unique)} unique formats: {[(f['height'], f['size_mb']) for f in unique]}")
+            return unique[:8]
     except Exception as e:
         logging.error(f"get_available_formats error: {e}")
         return []
 
 
+# ============================================================
+# ✅ إصلاح #2: download_video — دعم تويتر محسّن + يوتيوب
+# ============================================================
 def download_video(url, output_path):
-    """
-    تنزيل بأعلى جودة مع دعم كامل لجميع المنصات.
-    يستخدم عدة محاولات متتالية مع إعدادات مختلفة لتجنب الفشل.
-    """
     original_url = url
     is_twitter = any(d in url for d in ['twitter.com', 'x.com'])
     is_tiktok = 'tiktok.com' in url
     is_youtube = 'youtube.com' in url or 'youtu.be' in url
 
+    # تحويل روابط تويتر إلى fxtwitter
     if is_twitter:
         url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
         logging.info(f"Twitter URL converted: {url}")
@@ -324,7 +344,27 @@ def download_video(url, output_path):
         })
         attempts.append(('twitter_legacy', original_url, opts2))
 
-    # محاولة 3: يوتيوب tv_embedded
+    # ✅ محاولة 3: تويتر graphql (الافتراضي الحديث)
+    if is_twitter:
+        opts3 = base_ydl_opts()
+        opts3.update({
+            'format': 'bv*+ba/b',
+            'merge_output_format': 'mp4',
+            'outtmpl': output_path,
+        })
+        # لا نضيف extractor_args → يستخدم الافتراضي (graphql)
+        attempts.append(('twitter_graphql', original_url, opts3))
+
+    # ✅ محاولة 4: تويتر عبر gallery-dl (للصور والفيديو)
+    if is_twitter:
+        opts4 = base_ydl_opts()
+        opts4.update({
+            'format': 'best',
+            'outtmpl': output_path,
+        })
+        attempts.append(('twitter_best', original_url, opts4))
+
+    # محاولة 5: يوتيوب tv_embedded
     if is_youtube:
         opts_yt1 = base_ydl_opts()
         opts_yt1.update({
@@ -340,7 +380,7 @@ def download_video(url, output_path):
         })
         attempts.append(('youtube_tv_embedded', original_url, opts_yt1))
 
-    # محاولة 4: يوتيوب mweb
+    # محاولة 6: يوتيوب mweb
     if is_youtube:
         opts_yt2 = base_ydl_opts()
         opts_yt2.update({
@@ -355,13 +395,13 @@ def download_video(url, output_path):
         })
         attempts.append(('youtube_mweb', original_url, opts_yt2))
 
-    # محاولة 5: أفضل ملف مدمج (عام)
-    opts3 = base_ydl_opts()
-    opts3.update({
+    # محاولة 7: أفضل ملف مدمج (عام)
+    opts7 = base_ydl_opts()
+    opts7.update({
         'format': 'b',
         'outtmpl': output_path,
     })
-    attempts.append(('best_merged', original_url, opts3))
+    attempts.append(('best_merged', original_url, opts7))
 
     last_error = None
     for attempt_name, attempt_url, opts in attempts:
@@ -384,7 +424,6 @@ def download_video(url, output_path):
 
 
 def download_specific_format(url, output_path, format_id, height=None):
-    """تنزيل جودة محددة مع نظام محاولات متعدد."""
     original_url = url
     if any(d in url for d in ['twitter.com', 'x.com']):
         url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
@@ -520,7 +559,7 @@ def find_output_file(temp_path):
 
 
 # ============================================================
-# Process download
+# ✅ إصلاح #3: process_download — دعم الصور بشكل كامل
 # ============================================================
 def process_download(task: dict):
     chat_id = task['chat_id']
@@ -537,10 +576,31 @@ def process_download(task: dict):
 
         if not ok:
             logging.info(f"yt-dlp failed ({err}), trying gallery-dl...")
+            # ✅ محاولة gallery-dl للصور
             ok2, files = download_gallery(url, temp_dir)
             if ok2 and files:
                 send_gallery(chat_id, files)
                 return
+
+            # ✅ محاولة yt-dlp مع ignore_no_formats_error
+            logging.info("gallery-dl failed, trying yt-dlp with ignore-no-formats-error...")
+            try:
+                ydl_opts = base_ydl_opts()
+                ydl_opts.update({
+                    'ignore_no_formats_error': True,
+                    'outtmpl': temp,
+                })
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                final = find_output_file(temp)
+                if final and os.path.getsize(final) > 0:
+                    size_mb = os.path.getsize(final) / (1024 * 1024)
+                    with open(final, 'rb') as v:
+                        bot.send_video(chat_id, v, timeout=180, supports_streaming=True)
+                    return
+            except Exception as yt_err:
+                logging.warning(f"ignore_no_formats_error attempt failed: {yt_err}")
+
             bot.send_message(chat_id, f"Download failed.\n\n{err}")
             return
 
@@ -574,7 +634,6 @@ def process_download(task: dict):
                 supports_streaming=True
             )
 
-        # ✅ إصلاح #9: جلب التنسيقات في الخلفية لتفعيل زر More فوراً
         threading.Thread(
             target=_background_fetch_formats,
             args=(user_id, url),
@@ -609,8 +668,13 @@ def send_gallery(chat_id, files):
     sent_count = 0
     for f in images[:10]:
         try:
+            size_mb = os.path.getsize(f) / (1024 * 1024)
             with open(f, 'rb') as img:
-                bot.send_photo(chat_id, img, timeout=120)
+                if size_mb > 10:
+                    # ✅ إذا كانت الصورة > 10MB، أرسلها كملف
+                    bot.send_document(chat_id, img, timeout=120)
+                else:
+                    bot.send_photo(chat_id, img, timeout=120)
             sent_count += 1
         except Exception as e:
             logging.error(f"send_photo failed: {e}")
@@ -630,7 +694,6 @@ def send_gallery(chat_id, files):
 
 
 def send_more_options(chat_id, user_id, url):
-    """✅ إصلاح #9: استخدام التنسيقات المخزنة مؤقتاً إن وُجدت."""
     formats = _get_user_formats(user_id)
     if not formats:
         formats = get_available_formats(url)
@@ -873,7 +936,6 @@ def run_bot():
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
 
 
-# ✅ إصلاح #8: 3 عمال متوازيين بدلاً من عامل واحد
 NUM_WORKERS = 3
 for i in range(NUM_WORKERS):
     threading.Thread(target=download_worker, args=(i + 1,), daemon=True).start()
