@@ -88,13 +88,12 @@ def check_rate_limit(user_id: int):
 # Queue and shared state
 # ============================================================
 download_queue = queue.Queue(maxsize=100)
-# ✅ إصلاح #4: تخزين timestamp مع الرابط
-user_pending = {}  # {user_id: {'url': str, 'ts': float}}
+user_pending = {}  # {user_id: {'url': str, 'ts': float, 'formats': list|None}}
 USER_PENDING_TTL = 3600  # ساعة واحدة
+_cleanup_counter = 0
 
 
 def _cleanup_user_pending():
-    """إزالة الروابط القديمة من user_pending لتجنب تسريب الذاكرة."""
     now = time.time()
     stale = [uid for uid, data in user_pending.items()
              if now - data.get('ts', 0) > USER_PENDING_TTL]
@@ -104,13 +103,16 @@ def _cleanup_user_pending():
         logging.info(f"Cleaned {len(stale)} stale entries from user_pending")
 
 
-def _store_user_pending(user_id: int, url: str):
-    """تخزين الرابط مع timestamp."""
-    user_pending[user_id] = {'url': url, 'ts': time.time()}
+def _store_user_pending(user_id: int, url: str, formats=None):
+    existing = user_pending.get(user_id, {})
+    user_pending[user_id] = {
+        'url': url,
+        'ts': time.time(),
+        'formats': formats if formats is not None else existing.get('formats'),
+    }
 
 
 def _get_user_pending(user_id: int):
-    """استرجاع الرابط مع التحقق من صلاحيته."""
     data = user_pending.get(user_id)
     if not data:
         return None
@@ -120,14 +122,35 @@ def _get_user_pending(user_id: int):
     return data.get('url')
 
 
+def _get_user_formats(user_id: int):
+    data = user_pending.get(user_id)
+    if not data:
+        return None
+    return data.get('formats')
+
+
+def _background_fetch_formats(user_id: int, url: str):
+    """جلب التنسيقات في الخلفية بعد إرسال الفيديو."""
+    try:
+        formats = get_available_formats(url)
+        if formats and user_id in user_pending:
+            user_pending[user_id]['formats'] = formats
+            logging.info(f"Background formats cached for user {user_id}: {len(formats)} formats")
+    except Exception as e:
+        logging.warning(f"background fetch formats failed: {e}")
+
+
 def download_worker():
+    global _cleanup_counter
     while True:
         try:
             task = download_queue.get(timeout=5)
             if task is None:
                 break
-            # ✅ تنظيف دوري لـ user_pending عند كل مهمة
-            _cleanup_user_pending()
+            # ✅ تنظيف كل 50 مهمة فقط لتسريع الأداء
+            _cleanup_counter += 1
+            if _cleanup_counter % 50 == 0:
+                _cleanup_user_pending()
             process_download(task)
             download_queue.task_done()
         except queue.Empty:
@@ -161,6 +184,12 @@ def base_ydl_opts():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
+        # ✅ إصلاح يوتيوب: تجربة عملاء متعددين لتجاوز حظر مراكز البيانات
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'tv_embedded', 'web_safari', 'mweb'],
+            }
+        },
         'quiet': True,
         'no_warnings': True,
         'geo_bypass': True,
@@ -190,6 +219,8 @@ def translate_error(err: str) -> str:
         return "Target server rejected the request. Try again."
     if 'Unable to extract' in err:
         return "Unable to extract video data."
+    if 'Failed to extract any player response' in err:
+        return "YouTube blocked this request from the server. Try again later."
     if 'Video unavailable' in err:
         return "Video unavailable."
     if 'ffmpeg' in err.lower():
@@ -235,13 +266,11 @@ def download_video(url, output_path):
     """
     تنزيل بأعلى جودة مع دعم كامل لجميع المنصات.
     يستخدم عدة محاولات متتالية مع إعدادات مختلفة لتجنب الفشل.
-    
-    ✅ إصلاح #3: تمت إزالة منطق gallery-dl المكرر (كان ينشئ /tmp/gallery_fallback
-    ولا ينظفه). الآن gallery-dl مسؤولية process_download فقط.
     """
     original_url = url
     is_twitter = any(d in url for d in ['twitter.com', 'x.com'])
     is_tiktok = 'tiktok.com' in url
+    is_youtube = 'youtube.com' in url or 'youtu.be' in url
 
     # تحويل روابط تويتر إلى fxtwitter (يعمل بشكل أفضل مع yt-dlp)
     if is_twitter:
@@ -274,21 +303,44 @@ def download_video(url, output_path):
         })
         attempts.append(('twitter_legacy', original_url, opts2))
 
-    # محاولة 3: أفضل ملف مدمج
+    # ✅ محاولة يوتيوب بديلة 1: tv_embedded (يعمل بدون po_token)
+    if is_youtube:
+        opts_yt1 = base_ydl_opts()
+        opts_yt1.update({
+            'format': 'bv*+ba/b',
+            'merge_output_format': 'mp4',
+            'outtmpl': output_path,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['tv_embedded', 'web_embedded'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
+        })
+        attempts.append(('youtube_tv_embedded', original_url, opts_yt1))
+
+    # ✅ محاولة يوتيوب بديلة 2: mweb (بدون po_token)
+    if is_youtube:
+        opts_yt2 = base_ydl_opts()
+        opts_yt2.update({
+            'format': 'bv*+ba/b',
+            'merge_output_format': 'mp4',
+            'outtmpl': output_path,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['mweb', 'web'],
+                }
+            },
+        })
+        attempts.append(('youtube_mweb', original_url, opts_yt2))
+
+    # محاولة عامة: أفضل ملف مدمج
     opts3 = base_ydl_opts()
     opts3.update({
         'format': 'b',
         'outtmpl': output_path,
     })
     attempts.append(('best_merged', original_url, opts3))
-
-    # محاولة 4: أسوأ جودة كحل أخير
-    opts4 = base_ydl_opts()
-    opts4.update({
-        'format': 'w',
-        'outtmpl': output_path,
-    })
-    attempts.append(('worst', original_url, opts4))
 
     last_error = None
     for attempt_name, attempt_url, opts in attempts:
@@ -311,11 +363,7 @@ def download_video(url, output_path):
 
 
 def download_specific_format(url, output_path, format_id, height=None):
-    """
-    تنزيل جودة محددة مع نظام محاولات متعدد.
-    
-    ✅ إصلاح #1: تستقبل height صراحةً بدلاً من استخراجه من format_id.
-    """
+    """تنزيل جودة محددة مع نظام محاولات متعدد."""
     original_url = url
     if any(d in url for d in ['twitter.com', 'x.com']):
         url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
@@ -339,9 +387,8 @@ def download_specific_format(url, output_path, format_id, height=None):
     })
     attempts.append(('specific_only', original_url, opts2))
 
-    # ✅ إصلاح #1: استخدام height الحقيقي بدلاً من format_id
+    # محاولة 3: أعلى جودة أقل من أو تساوي الارتفاع المطلوب
     if height and str(height).isdigit():
-        # محاولة 3: أعلى جودة أقل من أو تساوي الارتفاع المطلوب
         opts3 = base_ydl_opts()
         opts3.update({
             'format': f'bv*[height<={height}]+ba/b[height<={height}]/b',
@@ -465,7 +512,6 @@ def process_download(task: dict):
     temp = f"/tmp/v_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
     temp_dir = f"/tmp/g_{user_id}_{uuid.uuid4().hex[:8]}"
 
-    # ✅ إصلاح #2: تتبع الملف الفعلي المرسل لحذفه
     final = None
 
     try:
@@ -493,12 +539,10 @@ def process_download(task: dict):
                 f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).\n"
                 f"Use the options below to download a lower quality."
             )
-            # ✅ إصلاح #4: استخدام _store_user_pending مع timestamp
             _store_user_pending(user_id, url)
             send_more_options(chat_id, user_id, url)
             return
 
-        # ✅ إصلاح #4: استخدام _store_user_pending مع timestamp
         _store_user_pending(user_id, url)
 
         markup = types.InlineKeyboardMarkup()
@@ -512,6 +556,13 @@ def process_download(task: dict):
                 supports_streaming=True
             )
 
+        # ✅ جلب التنسيقات في الخلفية لتسريع زر More
+        threading.Thread(
+            target=_background_fetch_formats,
+            args=(user_id, url),
+            daemon=True
+        ).start()
+
     except Exception as e:
         logging.error(f"process_download error: {e}", exc_info=True)
         try:
@@ -519,11 +570,9 @@ def process_download(task: dict):
         except:
             pass
     finally:
-        # ✅ إصلاح #2: حذف الملف الفعلي (سواء .mp4 أو .mkv أو .webm)
         cleanup_file(temp)
         if final and final != temp:
             cleanup_file(final)
-        # ✅ إصلاح #3: حذف مجلد gallery-dl دائماً
         cleanup_dir(temp_dir)
 
 
@@ -563,17 +612,23 @@ def send_gallery(chat_id, files):
 
 
 def send_more_options(chat_id, user_id, url):
-    formats = get_available_formats(url)
+    # ✅ استخدام التنسيقات المخزنة مؤقتاً إذا متوفرة
+    formats = _get_user_formats(user_id)
+    if not formats:
+        formats = get_available_formats(url)
+        if formats and user_id in user_pending:
+            user_pending[user_id]['formats'] = formats
+
     if not formats:
         bot.send_message(chat_id, "No format information available.")
         return
+
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
     for f in formats:
         label = f"{f['height']}p"
         if f['size_mb']:
             label += f" - {f['size_mb']:.0f}MB"
-        # ✅ إصلاح #1: إضافة height إلى callback_data
         buttons.append(types.InlineKeyboardButton(
             label, callback_data=f"q|{f['id']}|{f['height']}|{f['height']}p"
         ))
@@ -633,7 +688,6 @@ def handle_dev(call):
 def handle_more(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
-    # ✅ إصلاح #4: استخدام _get_user_pending مع التحقق من TTL
     url = _get_user_pending(user_id)
 
     bot.answer_callback_query(call.id)
@@ -648,14 +702,12 @@ def handle_more(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('q|'))
 def handle_quality(call):
     try:
-        # ✅ إصلاح #1: استخراج height أيضاً من callback_data
         parts = call.data.split('|', 3)
         if len(parts) < 4:
             bot.answer_callback_query(call.id, "Invalid data.")
             return
         fmt_id = parts[1]
         height = parts[2]
-        # parts[3] هو label (غير مستخدم)
 
         user_id = call.from_user.id
         chat_id = call.message.chat.id
@@ -671,7 +723,6 @@ def handle_quality(call):
         final = None
 
         try:
-            # ✅ إصلاح #1: تمرير height
             ok, err = download_specific_format(url, temp, fmt_id, height=height)
             if not ok:
                 bot.send_message(chat_id, f"Download failed.\n\n{err}")
@@ -698,7 +749,6 @@ def handle_quality(call):
                 bot.send_video(chat_id, v, reply_markup=markup, timeout=180,
                                supports_streaming=True)
         finally:
-            # ✅ إصلاح #2: حذف الملف الفعلي
             cleanup_file(temp)
             if final and final != temp:
                 cleanup_file(final)
