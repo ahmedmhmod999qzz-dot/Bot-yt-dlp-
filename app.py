@@ -88,7 +88,36 @@ def check_rate_limit(user_id: int):
 # Queue and shared state
 # ============================================================
 download_queue = queue.Queue(maxsize=100)
-user_pending = {}  # {user_id: url} for "More" button
+# ✅ إصلاح #4: تخزين timestamp مع الرابط
+user_pending = {}  # {user_id: {'url': str, 'ts': float}}
+USER_PENDING_TTL = 3600  # ساعة واحدة
+
+
+def _cleanup_user_pending():
+    """إزالة الروابط القديمة من user_pending لتجنب تسريب الذاكرة."""
+    now = time.time()
+    stale = [uid for uid, data in user_pending.items()
+             if now - data.get('ts', 0) > USER_PENDING_TTL]
+    for uid in stale:
+        user_pending.pop(uid, None)
+    if stale:
+        logging.info(f"Cleaned {len(stale)} stale entries from user_pending")
+
+
+def _store_user_pending(user_id: int, url: str):
+    """تخزين الرابط مع timestamp."""
+    user_pending[user_id] = {'url': url, 'ts': time.time()}
+
+
+def _get_user_pending(user_id: int):
+    """استرجاع الرابط مع التحقق من صلاحيته."""
+    data = user_pending.get(user_id)
+    if not data:
+        return None
+    if time.time() - data.get('ts', 0) > USER_PENDING_TTL:
+        user_pending.pop(user_id, None)
+        return None
+    return data.get('url')
 
 
 def download_worker():
@@ -97,6 +126,8 @@ def download_worker():
             task = download_queue.get(timeout=5)
             if task is None:
                 break
+            # ✅ تنظيف دوري لـ user_pending عند كل مهمة
+            _cleanup_user_pending()
             process_download(task)
             download_queue.task_done()
         except queue.Empty:
@@ -204,11 +235,13 @@ def download_video(url, output_path):
     """
     تنزيل بأعلى جودة مع دعم كامل لجميع المنصات.
     يستخدم عدة محاولات متتالية مع إعدادات مختلفة لتجنب الفشل.
+    
+    ✅ إصلاح #3: تمت إزالة منطق gallery-dl المكرر (كان ينشئ /tmp/gallery_fallback
+    ولا ينظفه). الآن gallery-dl مسؤولية process_download فقط.
     """
     original_url = url
     is_twitter = any(d in url for d in ['twitter.com', 'x.com'])
     is_tiktok = 'tiktok.com' in url
-    is_instagram = 'instagram.com' in url
 
     # تحويل روابط تويتر إلى fxtwitter (يعمل بشكل أفضل مع yt-dlp)
     if is_twitter:
@@ -274,36 +307,14 @@ def download_video(url, output_path):
             logging.warning(f"[{attempt_name}] exception: {last_error[:150]}")
             continue
 
-    # فشلت كل المحاولات - جرب gallery-dl
-    if is_twitter or is_instagram:
-        logging.info("All yt-dlp attempts failed, trying gallery-dl...")
-        try:
-            from gallery_dl import job
-            temp_dir = os.path.dirname(output_path) + "/gallery_fallback"
-            os.makedirs(temp_dir, exist_ok=True)
-            config = {
-                'base-directory': temp_dir,
-                'filename': '{num:03d}_{filename}.{extension}',
-                'quiet': True,
-            }
-            j = job.DownloadJob(original_url, config=config)
-            j.run()
-            files = sorted([f for f in os.listdir(temp_dir)
-                            if os.path.isfile(os.path.join(temp_dir, f))])
-            import shutil
-            for f in files:
-                if f.endswith(('.mp4', '.webm', '.mov', '.mkv')):
-                    shutil.move(os.path.join(temp_dir, f), output_path)
-                    return True, None
-        except Exception as ge:
-            logging.error(f"gallery-dl fallback failed: {ge}")
-
     return False, translate_error(last_error or "All attempts failed")
 
 
-def download_specific_format(url, output_path, format_id):
+def download_specific_format(url, output_path, format_id, height=None):
     """
     تنزيل جودة محددة مع نظام محاولات متعدد.
+    
+    ✅ إصلاح #1: تستقبل height صراحةً بدلاً من استخراجه من format_id.
     """
     original_url = url
     if any(d in url for d in ['twitter.com', 'x.com']):
@@ -328,19 +339,16 @@ def download_specific_format(url, output_path, format_id):
     })
     attempts.append(('specific_only', original_url, opts2))
 
-    # محاولة 3: أعلى جودة أقل من أو تساوي المطلوب
-    try:
-        height = format_id.replace('p', '').strip()
-        if height.isdigit():
-            opts3 = base_ydl_opts()
-            opts3.update({
-                'format': f'bv*[height<={height}]+ba/b[height<={height}]/b',
-                'merge_output_format': 'mp4',
-                'outtmpl': output_path,
-            })
-            attempts.append(('height_filter', original_url, opts3))
-    except Exception:
-        pass
+    # ✅ إصلاح #1: استخدام height الحقيقي بدلاً من format_id
+    if height and str(height).isdigit():
+        # محاولة 3: أعلى جودة أقل من أو تساوي الارتفاع المطلوب
+        opts3 = base_ydl_opts()
+        opts3.update({
+            'format': f'bv*[height<={height}]+ba/b[height<={height}]/b',
+            'merge_output_format': 'mp4',
+            'outtmpl': output_path,
+        })
+        attempts.append(('height_filter', original_url, opts3))
 
     last_error = None
     for attempt_name, attempt_url, opts in attempts:
@@ -457,6 +465,9 @@ def process_download(task: dict):
     temp = f"/tmp/v_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
     temp_dir = f"/tmp/g_{user_id}_{uuid.uuid4().hex[:8]}"
 
+    # ✅ إصلاح #2: تتبع الملف الفعلي المرسل لحذفه
+    final = None
+
     try:
         ok, err = download_video(url, temp)
 
@@ -482,12 +493,13 @@ def process_download(task: dict):
                 f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).\n"
                 f"Use the options below to download a lower quality."
             )
-            user_pending[user_id] = url
+            # ✅ إصلاح #4: استخدام _store_user_pending مع timestamp
+            _store_user_pending(user_id, url)
             send_more_options(chat_id, user_id, url)
-            cleanup_file(final)
             return
 
-        user_pending[user_id] = url
+        # ✅ إصلاح #4: استخدام _store_user_pending مع timestamp
+        _store_user_pending(user_id, url)
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("More", callback_data="more"))
@@ -507,7 +519,11 @@ def process_download(task: dict):
         except:
             pass
     finally:
+        # ✅ إصلاح #2: حذف الملف الفعلي (سواء .mp4 أو .mkv أو .webm)
         cleanup_file(temp)
+        if final and final != temp:
+            cleanup_file(final)
+        # ✅ إصلاح #3: حذف مجلد gallery-dl دائماً
         cleanup_dir(temp_dir)
 
 
@@ -557,8 +573,9 @@ def send_more_options(chat_id, user_id, url):
         label = f"{f['height']}p"
         if f['size_mb']:
             label += f" - {f['size_mb']:.0f}MB"
+        # ✅ إصلاح #1: إضافة height إلى callback_data
         buttons.append(types.InlineKeyboardButton(
-            label, callback_data=f"q|{f['id']}|{f['height']}p"
+            label, callback_data=f"q|{f['id']}|{f['height']}|{f['height']}p"
         ))
     buttons.append(types.InlineKeyboardButton("Audio Only (MP3)", callback_data="a"))
     markup.add(*buttons)
@@ -601,4 +618,193 @@ def welcome(message):
     )
 
     try:
-        bot.send_photo(message.chat.id, PHOTO_FILE_ID, caption=text, rep
+        bot.send_photo(message.chat.id, PHOTO_FILE_ID, caption=text, reply_markup=markup)
+    except Exception as e:
+        logging.error(f"send_photo failed: {e}")
+        bot.reply_to(message, text, reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'dev')
+def handle_dev(call):
+    bot.answer_callback_query(call.id, "Under development", show_alert=False)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'more')
+def handle_more(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    # ✅ إصلاح #4: استخدام _get_user_pending مع التحقق من TTL
+    url = _get_user_pending(user_id)
+
+    bot.answer_callback_query(call.id)
+
+    if not url:
+        bot.send_message(chat_id, "Session expired. Please send the URL again.")
+        return
+
+    send_more_options(chat_id, user_id, url)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('q|'))
+def handle_quality(call):
+    try:
+        # ✅ إصلاح #1: استخراج height أيضاً من callback_data
+        parts = call.data.split('|', 3)
+        if len(parts) < 4:
+            bot.answer_callback_query(call.id, "Invalid data.")
+            return
+        fmt_id = parts[1]
+        height = parts[2]
+        # parts[3] هو label (غير مستخدم)
+
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        url = _get_user_pending(user_id)
+
+        bot.answer_callback_query(call.id, "Processing...")
+
+        if not url:
+            bot.send_message(chat_id, "Session expired.")
+            return
+
+        temp = f"/tmp/q_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
+        final = None
+
+        try:
+            # ✅ إصلاح #1: تمرير height
+            ok, err = download_specific_format(url, temp, fmt_id, height=height)
+            if not ok:
+                bot.send_message(chat_id, f"Download failed.\n\n{err}")
+                return
+
+            final = find_output_file(temp)
+            if not final:
+                bot.send_message(chat_id, "File was not created.")
+                return
+
+            size_mb = os.path.getsize(final) / (1024 * 1024)
+
+            if size_mb > 50:
+                bot.send_message(
+                    chat_id,
+                    f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB)."
+                )
+                return
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("More", callback_data="more"))
+
+            with open(final, 'rb') as v:
+                bot.send_video(chat_id, v, reply_markup=markup, timeout=180,
+                               supports_streaming=True)
+        finally:
+            # ✅ إصلاح #2: حذف الملف الفعلي
+            cleanup_file(temp)
+            if final and final != temp:
+                cleanup_file(final)
+    except Exception as e:
+        logging.error(f"handle_quality error: {e}", exc_info=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'a')
+def handle_audio(call):
+    try:
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        url = _get_user_pending(user_id)
+
+        bot.answer_callback_query(call.id, "Processing...")
+
+        if not url:
+            bot.send_message(chat_id, "Session expired.")
+            return
+
+        temp = f"/tmp/a_{user_id}_{uuid.uuid4().hex[:8]}"
+        final = None
+
+        try:
+            ok, err = download_audio(url, temp)
+            if not ok:
+                bot.send_message(chat_id, f"Download failed.\n\n{err}")
+                return
+
+            final = find_output_file(temp + ".mp3") or find_output_file(temp)
+            if not final:
+                bot.send_message(chat_id, "File was not created.")
+                return
+
+            with open(final, 'rb') as a:
+                bot.send_audio(chat_id, a, timeout=180)
+        finally:
+            cleanup_file(temp + ".mp3")
+            cleanup_file(temp)
+            if final and final not in (temp, temp + ".mp3"):
+                cleanup_file(final)
+    except Exception as e:
+        logging.error(f"handle_audio error: {e}", exc_info=True)
+
+
+@bot.message_handler(func=lambda m: True)
+def handle(message):
+    logging.info(f"Got message: {message.text}")
+    url = message.text.strip()
+
+    if not re.match(r'https?://', url):
+        bot.reply_to(message, "Please send a valid URL starting with http:// or https://")
+        return
+
+    if not is_allowed_url(url):
+        bot.reply_to(message, "This domain is not supported.")
+        return
+
+    allowed, wait = check_rate_limit(message.from_user.id)
+    if not allowed:
+        bot.reply_to(message,
+            f"Rate limit exceeded (5 links per minute).\nTry again in {wait} seconds.")
+        return
+
+    try:
+        msg = bot.reply_to(message, "Received. Processing...")
+        task = {
+            'chat_id': message.chat.id,
+            'user_id': message.from_user.id,
+            'url': url,
+            'msg_id': msg.message_id,
+        }
+        download_queue.put_nowait(task)
+    except queue.Full:
+        bot.reply_to(message, "Server busy. Try again shortly.")
+
+
+# ============================================================
+# Flask
+# ============================================================
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "queue_size": download_queue.qsize()}), 200
+
+
+@app.route('/')
+def index():
+    return "Bot is running!", 200
+
+
+# ============================================================
+# Run
+# ============================================================
+def run_bot():
+    try:
+        bot.remove_webhook()
+        logging.info("Old webhook removed.")
+    except Exception as e:
+        logging.warning(f"remove_webhook: {e}")
+    logging.info("=== Starting polling ===")
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+
+
+threading.Thread(target=download_worker, daemon=True).start()
+threading.Thread(target=run_bot, daemon=True).start()
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
