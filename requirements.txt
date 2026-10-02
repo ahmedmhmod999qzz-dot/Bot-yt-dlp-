@@ -1,7 +1,7 @@
 Flask==3.0.3
 pyTelegramBotAPI==4.17.0
 gunicorn==22.0.0
-yt-dlp
+yt-dlp[default]>=2026.8.18
 imageio-ffmpeg
 curl_cffi
 gallery-dl
