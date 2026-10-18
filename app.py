@@ -600,9 +600,31 @@ def try_fxtwitter(url: str, workdir: str):
 # استراتيجية TikTok: tikwm API (صور + موسيقى + فيديو HD)
 # يعمل من السيرفرات السحابية حتى عندما يحظر تيك توك yt-dlp
 # ============================================================
+TIKWM_HOSTS = ("https://www.tikwm.com/api/", "https://tikwm.com/api/")
+
+
+def _tikwm_api(url: str):
+    """تجربة tikwm بعدة مضيفات وطرق (GET/POST) — بعض الشبكات تحظر مضيفاً أو طريقة دون أخرى."""
+    for host in TIKWM_HOSTS:
+        data = api_get_json(f'{host}?url={quote(url, safe="")}', timeout=40)
+        if data and data.get('code') == 0:
+            return data
+        try:
+            from curl_cffi import requests as cffi_requests
+            r = cffi_requests.post(host, data={'url': url, 'hd': '1'},
+                                   impersonate='chrome', timeout=40)
+            if r.status_code == 200:
+                data = r.json()
+                if data and data.get('code') == 0:
+                    return data
+        except Exception as e:
+            logging.warning(f"tikwm POST failed ({host}): {str(e)[:100]}")
+    return None
+
+
 def try_tikwm(url: str, workdir: str):
-    data = api_get_json(f'https://www.tikwm.com/api/?url={quote(url, safe="")}', timeout=40)
-    if not data or data.get('code') != 0:
+    data = _tikwm_api(url)
+    if not data:
         return None
     d = data.get('data') or {}
 
