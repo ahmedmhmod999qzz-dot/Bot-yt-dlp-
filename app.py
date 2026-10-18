@@ -10,7 +10,7 @@ import socket
 import subprocess
 import yt_dlp
 import imageio_ffmpeg
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from collections import defaultdict
 from flask import Flask, jsonify
 import telebot
@@ -33,11 +33,14 @@ logging.info(f"FFmpeg path: {FFMPEG_PATH}")
 
 socket.setdefaulttimeout(30)
 
-MAX_SLIDESHOW_IMAGES = int(os.environ.get("MAX_SLIDESHOW_IMAGES", "15"))
+MAX_SLIDESHOW_IMAGES = int(os.environ.get("MAX_SLIDESHOW_IMAGES", "20"))
+
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
 
 
 # ============================================================
-# Cookies (اختياري — لتجاوز قيود "المحتوى الحساس" في TikTok/Instagram/YouTube)
+# Cookies (اختياري — ضروري لإنستجرام/المحتوى المقيد)
 # ضع محتوى ملف الكوكيز (Netscape format) في متغير البيئة YTDLP_COOKIES
 # (نص عادي أو base64)
 # ============================================================
@@ -88,6 +91,8 @@ ALLOWED_DOMAINS = {
     'streamable.com', 'gfycat.com',
     'coub.com', 'likee.video',
     'threads.net', 'truthsocial.com',
+    'kwai.com', 'snackvideo.com',
+    'capcut.com', 'xiaohongshu.com', 'xhslink.com',
 }
 
 
@@ -103,6 +108,21 @@ def is_allowed_url(url: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def classify_url(url: str) -> str:
+    d = urlparse(url).netloc.lower()
+    if 'youtube.com' in d or 'youtu.be' in d:
+        return 'youtube'
+    if 'tiktok.com' in d:
+        return 'tiktok'
+    if 'instagram.com' in d:
+        return 'instagram'
+    if 'twitter.com' in d or 'x.com' in d or 't.co' in d:
+        return 'twitter'
+    if 'facebook.com' in d or 'fb.watch' in d or 'fb.com' in d:
+        return 'facebook'
+    return 'other'
 
 
 # ============================================================
@@ -142,7 +162,7 @@ def check_rate_limit(user_id: int):
 # Queue and shared state
 # ============================================================
 download_queue = queue.Queue(maxsize=100)
-user_pending = {}  # {user_id: {'url', 'ts', 'formats', 'assets': {'images': [...], 'audio': path, 'dir': dir}}}
+user_pending = {}  # {user_id: {'url', 'ts', 'formats', 'assets': {...}}}
 USER_PENDING_TTL = 3600
 
 
@@ -166,6 +186,12 @@ def _store_user_pending(user_id: int, url: str, formats=None, assets=None):
             'formats': formats if formats is not None else existing.get('formats'),
             'assets': assets if assets is not None else existing.get('assets'),
         }
+
+
+def _clear_user_assets(user_id: int):
+    with _state_lock:
+        if user_id in user_pending:
+            user_pending[user_id]['assets'] = None
 
 
 def _get_pending(user_id: int):
@@ -307,22 +333,23 @@ def find_output_file(temp_path):
 
 
 # ============================================================
-# yt-dlp options and functions
+# yt-dlp options
 # ============================================================
 def base_ydl_opts():
     opts = {
         'noplaylist': True,
-        'retries': 10,
-        'fragment_retries': 10,
+        'retries': 8,
+        'fragment_retries': 8,
         'concurrent_fragment_downloads': 4,
         'ffmpeg_location': FFMPEG_PATH,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'User-Agent': USER_AGENT,
             'Accept-Language': 'en-US,en;q=0.9',
         },
         'extractor_args': {
             'youtube': {
-                'player_client': ['ios', 'android', 'tv_embedded', 'web_safari', 'mweb'],
+                # عملاء لا يطلبون PO Token أولاً — ios/android يُرفضون من سيرفرات سحابية
+                'player_client': ['android_vr', 'tv_embedded', 'web_embedded', 'ios', 'mweb'],
             }
         },
         'quiet': True,
@@ -336,20 +363,37 @@ def base_ydl_opts():
     return opts
 
 
+def _yt_opts(fmt, output_path, clients=None, player_skip=None):
+    opts = base_ydl_opts()
+    opts.update({
+        'format': fmt,
+        'outtmpl': output_path,
+        'merge_output_format': 'mp4',
+    })
+    if clients:
+        ea = {'youtube': {'player_client': clients}}
+        if player_skip:
+            ea['youtube']['player_skip'] = player_skip
+        opts['extractor_args'] = ea
+    return opts
+
+
 def translate_error(err: str) -> str:
     err = err or ""
+    low = err.lower()
     if 'may not be comfortable' in err or 'Log in for access' in err:
         return ("This post is restricted by the platform (age/sensitive content) and requires "
                 "a logged-in account. The bot owner can unlock it by adding cookies "
                 "(YTDLP_COOKIES environment variable).")
-    if 'Private video' in err or 'This video is private' in err:
-        return "This video is private."
-    if 'not available' in err or 'This video is not available' in err:
-        return "Video is not available or has been removed."
-    if 'region' in err.lower() or 'geo' in err.lower():
+    if 'private' in low:
+        return "This content is private."
+    if 'not available' in low or 'has been removed' in low:
+        return "Content is not available or has been removed."
+    if 'region' in low or 'geo' in low:
         return "Video is geo-blocked in your region."
-    if 'Login required' in err or 'Sign in' in err:
-        return "This content requires login."
+    if 'login required' in low or 'sign in' in low or 'rate-limit' in low:
+        return ("This platform requires login from server IPs. The bot owner can fix this "
+                "by adding account cookies (YTDLP_COOKIES environment variable).")
     if 'Unsupported URL' in err:
         return "URL is not supported."
     if 'HTTP Error 429' in err:
@@ -357,19 +401,19 @@ def translate_error(err: str) -> str:
     if 'HTTP Error 403' in err:
         return "Server rejected the request (403)."
     if 'HTTP Error 404' in err:
-        return "Video not found (404)."
+        return "Content not found (404)."
     if 'Unexpected response' in err:
         return "Target server rejected the request. Try again."
     if 'Unable to extract' in err:
-        return "Unable to extract video data."
+        return "Unable to extract media data."
     if 'Failed to extract any player response' in err:
         return "YouTube blocked this request from the server. Try again later."
-    if 'no video' in err.lower() or 'There is no video' in err or 'No video formats' in err:
+    if 'no video' in low or 'no video formats' in low:
         return "No video found in this post (it may be photos only)."
     if 'Video unavailable' in err:
         return "Video unavailable."
-    if 'ffmpeg' in err.lower():
-        return "Video processing error (ffmpeg)."
+    if 'ffmpeg' in low:
+        return "Media processing error (ffmpeg)."
     clean = err.replace('ERROR:', '').strip()
     return f"Download failed: {clean[:200]}"
 
@@ -420,7 +464,7 @@ def get_available_formats(url: str) -> list:
                     seen[h] = f
 
             unique = sorted(seen.values(), key=lambda x: x['height'], reverse=True)
-            logging.info(f"Found {len(unique)} unique formats: {[(f['height'], f['size_mb']) for f in unique]}")
+            logging.info(f"Found {len(unique)} unique formats")
             return unique[:8]
     except Exception as e:
         logging.error(f"get_available_formats error: {e}")
@@ -428,82 +472,26 @@ def get_available_formats(url: str) -> list:
 
 
 # ============================================================
-# منشورات الصور: اكتشاف + تحميل الصور والصوت منفصلين
+# HTTP helpers (تمويه متصفح حقيقي عبر curl_cffi)
 # ============================================================
-IMAGE_EXTS = ('jpg', 'jpeg', 'png', 'webp')
-
-
-def _collect_slideshow_data(info):
-    """جمع روابط الصور وأفضل صيغة صوت من معلومات yt-dlp."""
-    if not info:
-        return None
-
-    entries = list(info.get('entries') or [])
-    if not entries:
-        entries = [info]
-
-    image_urls = []
-    audio_fmt = None
-    duration = info.get('duration') or 0
-
-    for entry in entries:
-        if not entry:
-            continue
-        if entry.get('duration') and not duration:
-            duration = entry['duration']
-        for f in entry.get('formats', []):
-            if not f or not f.get('url'):
-                continue
-            ext = (f.get('ext') or '').lower()
-            vcodec = f.get('vcodec')
-            acodec = f.get('acodec')
-            if ext in IMAGE_EXTS or (vcodec == 'none' and acodec == 'none' and ext not in ('mp4', 'webm', 'm4a', 'mp3', 'aac')):
-                if f['url'] not in image_urls:
-                    image_urls.append(f['url'])
-            elif (acodec and acodec != 'none') and (not vcodec or vcodec == 'none'):
-                abr = f.get('abr') or f.get('tbr') or 0
-                if audio_fmt is None or abr > (audio_fmt.get('abr') or audio_fmt.get('tbr') or 0):
-                    audio_fmt = f
-        direct_url = entry.get('url')
-        direct_ext = (entry.get('ext') or '').lower()
-        if direct_url and direct_ext in IMAGE_EXTS and direct_url not in image_urls:
-            image_urls.append(direct_url)
-
-    if not image_urls:
-        return None
-    return {
-        'images': image_urls[:MAX_SLIDESHOW_IMAGES],
-        'audio_url': audio_fmt.get('url') if audio_fmt else None,
-        'duration': duration,
-    }
-
-
-def extract_slideshow(url: str):
-    """فحص المنشور: هل هو صور؟ يرجع (data, None) أو (None, error_message)."""
-    errors = []
-    for extra in ({}, {'ignore_no_formats_error': True}):
-        try:
-            opts = base_ydl_opts()
-            # استخراج خفيف: محاولات قليلة حتى لا نستهلك رام/وقت عند فشل الفيديو
-            opts['retries'] = 2
-            opts['fragment_retries'] = 2
-            opts.update(extra)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            data = _collect_slideshow_data(info)
-            if data:
-                return data, None
-            return None, "The post has no downloadable images."
-        except Exception as e:
-            errors.append(str(e)[:200])
-    return None, errors[-1] if errors else "Unknown extraction error"
+def api_get_json(api_url: str, timeout: int = 30):
+    """طلب JSON من API خارجي."""
+    try:
+        from curl_cffi import requests as cffi_requests
+        r = cffi_requests.get(api_url, impersonate='chrome', timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        logging.warning(f"api_get_json HTTP {r.status_code}: {api_url[:80]}")
+    except Exception as e:
+        logging.warning(f"api_get_json failed: {str(e)[:120]}")
+    return None
 
 
 def fetch_file(media_url: str, dest: str, referer: str = None) -> bool:
     """تحميل ملف مباشر عبر curl_cffi (تمويه متصفح حقيقي)."""
     try:
         from curl_cffi import requests as cffi_requests
-        headers = {}
+        headers = {'User-Agent': USER_AGENT}
         if referer:
             headers['Referer'] = referer
         for attempt in range(3):
@@ -531,7 +519,7 @@ def fetch_file(media_url: str, dest: str, referer: str = None) -> bool:
         import urllib.request
         try:
             req = urllib.request.Request(media_url, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'User-Agent': USER_AGENT,
                 **({'Referer': referer} if referer else {}),
             })
             with urllib.request.urlopen(req, timeout=40) as r, open(dest, 'wb') as f:
@@ -540,6 +528,219 @@ def fetch_file(media_url: str, dest: str, referer: str = None) -> bool:
         except Exception as e:
             logging.warning(f"fetch_file (urllib) failed: {str(e)[:100]}")
             return False
+
+
+# ============================================================
+# Media bundle
+# ============================================================
+class MediaBundle:
+    """حاوية وسائط موحّدة لكل الاستراتيجيات."""
+    def __init__(self):
+        self.images = []   # مسارات ملفات صور محلية
+        self.videos = []   # مسارات ملفات فيديو محلية
+        self.audio = None  # مسار ملف صوت محلي
+        self.title = ''
+        self.duration = 0
+
+    def has_media(self) -> bool:
+        return bool(self.images or self.videos)
+
+
+# ============================================================
+# استراتيجية X (Twitter): API مباشر بدون تسجيل دخول
+# يدعم الصور والفيديو معاً
+# ============================================================
+def _tweet_id(url: str):
+    m = re.search(r'(?:twitter\.com|x\.com)/[^/]+/status(?:es)?/(\d+)', url)
+    return m.group(1) if m else None
+
+
+def try_fxtwitter(url: str, workdir: str):
+    """تنزيل محتوى تغريدة (صور + فيديو) عبر fxtwitter API."""
+    tid = _tweet_id(url)
+    if not tid:
+        return None
+    data = api_get_json(f'https://api.fxtwitter.com/status/{tid}')
+    if not data or not isinstance(data, dict):
+        return None
+    tweet = data.get('tweet') or {}
+    media = tweet.get('media') or {}
+    photos = media.get('photos') or []
+    videos = media.get('videos') or []
+    if not photos and not videos:
+        return None
+
+    os.makedirs(workdir, exist_ok=True)
+    bundle = MediaBundle()
+    bundle.title = (tweet.get('text') or '')[:900]
+
+    for i, p in enumerate(photos[:MAX_SLIDESHOW_IMAGES]):
+        u = (p or {}).get('url')
+        if not u:
+            continue
+        dest = os.path.join(workdir, f'img_{i:03d}.jpg')
+        if fetch_file(u, dest, referer=url):
+            bundle.images.append(dest)
+
+    for i, v in enumerate(videos[:3]):
+        u = (v or {}).get('url')
+        if not u:
+            continue
+        dest = os.path.join(workdir, f'vid_{i:03d}.mp4')
+        if fetch_file(u, dest, referer=url):
+            bundle.videos.append(dest)
+
+    if bundle.has_media():
+        logging.info(f"fxtwitter OK: {len(bundle.images)} photos, {len(bundle.videos)} videos")
+        return bundle
+    return None
+
+
+# ============================================================
+# استراتيجية TikTok: tikwm API (صور + موسيقى + فيديو HD)
+# يعمل من السيرفرات السحابية حتى عندما يحظر تيك توك yt-dlp
+# ============================================================
+def try_tikwm(url: str, workdir: str):
+    data = api_get_json(f'https://www.tikwm.com/api/?url={quote(url, safe="")}', timeout=40)
+    if not data or data.get('code') != 0:
+        return None
+    d = data.get('data') or {}
+
+    os.makedirs(workdir, exist_ok=True)
+    bundle = MediaBundle()
+    bundle.title = (d.get('title') or '')[:900]
+    bundle.duration = d.get('duration') or 0
+
+    images = d.get('images') or []
+    if images:
+        # منشور صور: صور + موسيقى
+        for i, u in enumerate(images[:MAX_SLIDESHOW_IMAGES]):
+            if not u:
+                continue
+            dest = os.path.join(workdir, f'img_{i:03d}.jpg')
+            if fetch_file(u, dest, referer=url):
+                bundle.images.append(dest)
+        music = d.get('music')
+        if music:
+            adest = os.path.join(workdir, 'audio.mp3')
+            if fetch_file(music, adest, referer=url):
+                bundle.audio = adest
+    else:
+        # فيديو: جودة HD أولاً
+        vu = d.get('hdplay') or d.get('play')
+        if vu:
+            vdest = os.path.join(workdir, 'video.mp4')
+            if fetch_file(vu, vdest, referer=url):
+                bundle.videos.append(vdest)
+
+    if bundle.has_media():
+        logging.info(f"tikwm OK: {len(bundle.images)} photos, {len(bundle.videos)} videos")
+        return bundle
+    return None
+
+
+# ============================================================
+# منشورات الصور عبر yt-dlp: اكتشاف + تحميل
+# ============================================================
+IMAGE_EXTS = ('jpg', 'jpeg', 'png', 'webp')
+
+
+def _pick_clip_url(entry):
+    """اختيار أفضل رابط mp4 مباشر لمقطع فيديو داخل كاروسيل."""
+    best = None
+    for f in entry.get('formats') or []:
+        if not f or not f.get('url'):
+            continue
+        if f.get('vcodec') in (None, 'none'):
+            continue
+        if (f.get('ext') or '').lower() != 'mp4':
+            continue
+        h = f.get('height') or 0
+        if best is None or h > (best.get('height') or 0):
+            if h <= 1080:
+                best = f
+            elif best is None:
+                best = f
+    if best:
+        return best['url']
+    u = entry.get('url')
+    if u and (entry.get('ext') or '').lower() == 'mp4':
+        return u
+    return None
+
+
+def _collect_slideshow_data(info):
+    """جمع روابط الصور والمقاطع وأفضل صيغة صوت من معلومات yt-dlp."""
+    if not info:
+        return None
+
+    entries = [e for e in (info.get('entries') or []) if e]
+    if not entries:
+        entries = [info]
+
+    image_urls = []
+    clip_urls = []
+    audio_fmt = None
+    duration = info.get('duration') or 0
+
+    for entry in entries:
+        if entry.get('duration') and not duration:
+            duration = entry['duration']
+
+        entry_has_video = False
+        for f in entry.get('formats') or []:
+            if not f or not f.get('url'):
+                continue
+            ext = (f.get('ext') or '').lower()
+            vcodec = f.get('vcodec')
+            acodec = f.get('acodec')
+            if ext in IMAGE_EXTS or (vcodec == 'none' and acodec == 'none'
+                                     and ext not in ('mp4', 'webm', 'm4a', 'mp3', 'aac', 'mov')):
+                if f['url'] not in image_urls:
+                    image_urls.append(f['url'])
+            elif (acodec and acodec != 'none') and (not vcodec or vcodec == 'none'):
+                abr = f.get('abr') or f.get('tbr') or 0
+                if audio_fmt is None or abr > (audio_fmt.get('abr') or audio_fmt.get('tbr') or 0):
+                    audio_fmt = f
+            elif vcodec and vcodec != 'none':
+                entry_has_video = True
+
+        direct_url = entry.get('url')
+        direct_ext = (entry.get('ext') or '').lower()
+        if direct_url and direct_ext in IMAGE_EXTS and direct_url not in image_urls:
+            image_urls.append(direct_url)
+        elif entry_has_video:
+            cu = _pick_clip_url(entry)
+            if cu and cu not in clip_urls:
+                clip_urls.append(cu)
+
+    if not image_urls and not clip_urls:
+        return None
+    return {
+        'images': image_urls[:MAX_SLIDESHOW_IMAGES],
+        'clips': clip_urls[:3],
+        'audio_url': audio_fmt.get('url') if audio_fmt else None,
+        'duration': duration,
+    }
+
+
+def extract_slideshow(url: str):
+    """فحص المنشور: هل هو صور/كاروسيل؟ يرجع (data, None) أو (None, error)."""
+    errors = []
+    for extra in ({'ignore_no_formats_error': True}, {}):
+        try:
+            opts = base_ydl_opts()
+            opts['retries'] = 2
+            opts['fragment_retries'] = 2
+            opts.update(extra)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            data = _collect_slideshow_data(info)
+            if data:
+                return data, None
+        except Exception as e:
+            errors.append(str(e)[:200])
+    return None, errors[-1] if errors else "No photo content detected"
 
 
 _encoders_cache = {}
@@ -557,7 +758,7 @@ def _has_encoder(name: str) -> bool:
 
 
 def merge_slideshow(image_paths: list, audio_path: str, out_path: str, total_duration=None) -> bool:
-    """دمج صور + صوت في فيديو MP4 واحد (ترميع خفيف لـ 512MB RAM)."""
+    """دمج صور + صوت في فيديو MP4 واحد (ترميز خفيف لـ 512MB RAM)."""
     n = len(image_paths)
     if not n or not audio_path or not os.path.exists(audio_path):
         return False
@@ -602,25 +803,23 @@ def merge_slideshow(image_paths: list, audio_path: str, out_path: str, total_dur
 
 
 def download_slideshow_assets(url: str, data: dict, workdir: str):
-    """تحميل صور وصوت منشور صور إلى القرص.
-
-    يرجع (assets_dict, None) أو (None, error_message)
-    assets_dict = {'images': [paths], 'audio': path|None, 'dir': workdir}
-    """
+    """تحميل صور ومقاطع وصوت منشور إلى القرص."""
     os.makedirs(workdir, exist_ok=True)
 
     image_paths = []
-    failed = 0
-    for idx, img_url in enumerate(data['images']):
+    for idx, img_url in enumerate(data.get('images') or []):
         dest = os.path.join(workdir, f'img_{idx:03d}.jpg')
         if fetch_file(img_url, dest, referer=url):
             image_paths.append(dest)
-        else:
-            failed += 1
-            logging.warning(f"slideshow image {idx} download failed")
 
-    if not image_paths:
-        return None, "Could not download any of the post images."
+    video_paths = []
+    for idx, clip_url in enumerate(data.get('clips') or []):
+        dest = os.path.join(workdir, f'clip_{idx:03d}.mp4')
+        if fetch_file(clip_url, dest, referer=url):
+            video_paths.append(dest)
+
+    if not image_paths and not video_paths:
+        return None, "Could not download any of the post media."
 
     audio_path = None
     if data.get('audio_url'):
@@ -628,185 +827,148 @@ def download_slideshow_assets(url: str, data: dict, workdir: str):
         if fetch_file(data['audio_url'], audio_dest, referer=url):
             audio_path = audio_dest
 
-    if not audio_path:
+    if not audio_path and image_paths:
         # احتياطي: الصوت عبر yt-dlp (يتعامل مع الروابط الموقّعة)
         try:
             audio_dest = os.path.join(workdir, 'audio')
             opts = base_ydl_opts()
             opts['retries'] = 3
-            opts.update({
-                'format': 'bestaudio/best',
-                'outtmpl': audio_dest,
-            })
+            opts.update({'format': 'bestaudio/best', 'outtmpl': audio_dest})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
             audio_path = find_output_file(audio_dest) or find_output_file(audio_dest + '.m4a')
         except Exception as e:
             logging.warning(f"slideshow audio via yt-dlp failed: {str(e)[:120]}")
 
-    return {'images': image_paths, 'audio': audio_path, 'dir': workdir,
-            'duration': data.get('duration')}, None
+    return {'images': image_paths, 'videos': video_paths, 'audio': audio_path,
+            'dir': workdir, 'duration': data.get('duration')}, None
 
 
-def download_video(url, output_path):
-    original_url = url
-    is_twitter = any(d in url for d in ['twitter.com', 'x.com'])
-    is_tiktok = 'tiktok.com' in url
-    is_youtube = 'youtube.com' in url or 'youtu.be' in url
+# ============================================================
+# تنزيل الفيديو: محاولات متعددة حسب المنصة
+# ============================================================
+def _ydl_try(opts, url):
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
 
-    if is_twitter:
-        url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
-        logging.info(f"Twitter URL converted: {url}")
 
-    attempts = []
+def download_video(url, output_path, platform='other'):
+    """سلسلة محاولات تنزيل فيديو حسب المنصة. يرجع (ok, error)."""
+    attempts = []  # (name, opts)
 
-    opts1 = base_ydl_opts()
-    opts1.update({
-        'format': 'bv*+ba/b',
-        'merge_output_format': 'mp4',
-        'outtmpl': output_path,
-    })
-    if is_twitter:
-        opts1['extractor_args'] = {'twitter': {'api': ['syndication']}}
-    if is_tiktok:
-        opts1['format'] = 'b'
-    attempts.append(('optimal', url, opts1))
-
-    if is_twitter:
-        opts2 = base_ydl_opts()
-        opts2.update({
-            'format': 'bv*+ba/b',
-            'merge_output_format': 'mp4',
-            'outtmpl': output_path,
-            'extractor_args': {'twitter': {'api': ['legacy']}},
-        })
-        attempts.append(('twitter_legacy', original_url, opts2))
-
-    if is_twitter:
-        opts3 = base_ydl_opts()
-        opts3.update({
-            'format': 'bv*+ba/b',
-            'merge_output_format': 'mp4',
-            'outtmpl': output_path,
-        })
-        attempts.append(('twitter_graphql', original_url, opts3))
-
-    if is_twitter:
-        opts4 = base_ydl_opts()
-        opts4.update({
-            'format': 'best',
-            'outtmpl': output_path,
-        })
-        attempts.append(('twitter_best', original_url, opts4))
-
-    if is_youtube:
-        opts_yt1 = base_ydl_opts()
-        opts_yt1.update({
-            'format': 'bv*+ba/b',
-            'merge_output_format': 'mp4',
-            'outtmpl': output_path,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['tv_embedded', 'web_embedded'],
-                    'player_skip': ['webpage', 'configs'],
-                }
-            },
-        })
-        attempts.append(('youtube_tv_embedded', original_url, opts_yt1))
-
-    if is_youtube:
-        opts_yt2 = base_ydl_opts()
-        opts_yt2.update({
-            'format': 'bv*+ba/b',
-            'merge_output_format': 'mp4',
-            'outtmpl': output_path,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['mweb', 'web'],
-                }
-            },
-        })
-        attempts.append(('youtube_mweb', original_url, opts_yt2))
-
-    opts7 = base_ydl_opts()
-    opts7.update({
-        'format': 'b',
-        'outtmpl': output_path,
-    })
-    attempts.append(('best_merged', original_url, opts7))
+    if platform == 'youtube':
+        attempts = [
+            ('yt_default_clients', _yt_opts('bv*+ba/b', output_path)),
+            ('yt_web_embedded', _yt_opts('bv*+ba/b', output_path,
+                                         clients=['web_embedded'],
+                                         player_skip=['webpage', 'configs'])),
+            ('yt_android_vr', _yt_opts('bv*+ba/b', output_path, clients=['android_vr'])),
+            ('yt_tv_embedded', _yt_opts('bv*+ba/b', output_path,
+                                        clients=['tv_embedded'],
+                                        player_skip=['webpage', 'configs'])),
+            ('yt_mweb_ios', _yt_opts('bv*+ba/b', output_path, clients=['mweb', 'ios'])),
+            ('yt_simple_best', _yt_opts('b[ext=mp4]/b', output_path)),
+        ]
+        if COOKIES_FILE:
+            attempts.insert(1, ('yt_web_cookies', _yt_opts('bv*+ba/b', output_path,
+                                                           clients=['web', 'mweb'])))
+    elif platform == 'twitter':
+        o = _yt_opts('bv*+ba/b', output_path)
+        o['extractor_args'] = {'twitter': {'api': ['syndication']}}
+        o2 = _yt_opts('bv*+ba/b', output_path)
+        o2['extractor_args'] = {'twitter': {'api': ['legacy']}}
+        attempts = [
+            ('twitter_syndication', o),
+            ('twitter_legacy', o2),
+            ('twitter_graphql', _yt_opts('bv*+ba/b', output_path)),
+            ('twitter_best', _yt_opts('b', output_path)),
+        ]
+    elif platform == 'tiktok':
+        attempts = [
+            ('tiktok_best', _yt_opts('b', output_path)),
+            ('tiktok_generic', _yt_opts('bv*+ba/b', output_path)),
+        ]
+    else:
+        attempts = [
+            ('optimal', _yt_opts('bv*+ba/b', output_path)),
+            ('best_merged', _yt_opts('b', output_path)),
+        ]
 
     last_error = None
-    for attempt_name, attempt_url, opts in attempts:
+    for name, opts in attempts:
         try:
-            logging.info(f"Trying download [{attempt_name}]: {attempt_url[:80]}")
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([attempt_url])
-            logging.info(f"Success with [{attempt_name}]")
-            return True, None
+            logging.info(f"Trying download [{name}]: {url[:80]}")
+            _ydl_try(opts, url)
+            if find_output_file(output_path):
+                logging.info(f"Success with [{name}]")
+                return True, None
+            last_error = "file not created"
         except yt_dlp.utils.DownloadError as e:
             last_error = str(e)
-            logging.warning(f"[{attempt_name}] failed: {last_error[:150]}")
-            continue
+            logging.warning(f"[{name}] failed: {last_error[:150]}")
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
-            logging.warning(f"[{attempt_name}] exception: {last_error[:150]}")
-            continue
+            logging.warning(f"[{name}] exception: {last_error[:150]}")
+        cleanup_partial(output_path)
 
     return False, translate_error(last_error or "All attempts failed")
 
 
-def download_specific_format(url, output_path, format_id, height=None):
-    original_url = url
-    if any(d in url for d in ['twitter.com', 'x.com']):
-        url = url.replace('twitter.com', 'fxtwitter.com').replace('x.com', 'fxtwitter.com')
+def cleanup_partial(output_path):
+    """حذف بقايا تنزيل فاشل حتى لا تخدع المحاولة التالية."""
+    base = os.path.basename(output_path).rsplit('.', 1)[0]
+    try:
+        for f in os.listdir('/tmp'):
+            if f.startswith(base):
+                p = os.path.join('/tmp', f)
+                if os.path.isfile(p):
+                    os.remove(p)
+    except Exception:
+        pass
 
+
+def download_specific_format(url, output_path, format_id, height=None):
+    platform = classify_url(url)
     attempts = []
 
-    opts1 = base_ydl_opts()
-    opts1.update({
-        'format': f'{format_id}+ba/b',
-        'merge_output_format': 'mp4',
-        'outtmpl': output_path,
-    })
-    attempts.append(('specific+audio', url, opts1))
+    opts1 = _yt_opts(f'{format_id}+ba/b', output_path)
+    attempts.append(('specific+audio', opts1))
 
     opts2 = base_ydl_opts()
-    opts2.update({
-        'format': format_id,
-        'outtmpl': output_path,
-    })
-    attempts.append(('specific_only', original_url, opts2))
+    opts2.update({'format': format_id, 'outtmpl': output_path})
+    attempts.append(('specific_only', opts2))
 
     if height and str(height).isdigit():
-        opts3 = base_ydl_opts()
-        opts3.update({
-            'format': f'bv*[height<={height}]+ba/b[height<={height}]/b',
-            'merge_output_format': 'mp4',
-            'outtmpl': output_path,
-        })
-        attempts.append(('height_filter', original_url, opts3))
+        opts3 = _yt_opts(f'bv*[height<={height}]+ba/b[height<={height}]/b', output_path)
+        attempts.append(('height_filter', opts3))
+
+    if platform == 'youtube':
+        opts4 = _yt_opts(f'bv*[height<={height}]+ba/b[height<={height}]/b' if height else 'b',
+                         output_path, clients=['android_vr', 'web_embedded'])
+        attempts.append(('yt_alt_clients', opts4))
 
     last_error = None
-    for attempt_name, attempt_url, opts in attempts:
+    for attempt_name, opts in attempts:
         try:
             logging.info(f"Trying format download [{attempt_name}]")
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([attempt_url])
-            return True, None
+            _ydl_try(opts, url)
+            if find_output_file(output_path):
+                return True, None
         except yt_dlp.utils.DownloadError as e:
             last_error = str(e)
             logging.warning(f"[{attempt_name}] failed: {last_error[:150]}")
-            continue
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
-            continue
+        cleanup_partial(output_path)
 
     return False, translate_error(last_error or "Format download failed")
 
 
 def download_audio(url, output_path):
-    ydl_opts = base_ydl_opts()
-    ydl_opts.update({
+    platform = classify_url(url)
+    attempts = []
+    o1 = base_ydl_opts()
+    o1.update({
         'format': 'bestaudio/best',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
@@ -815,61 +977,70 @@ def download_audio(url, output_path):
         }],
         'outtmpl': output_path,
     })
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return True, None
-    except yt_dlp.utils.DownloadError as e:
-        return False, translate_error(str(e))
-    except Exception as e:
-        return False, f"Technical error: {type(e).__name__}"
+    attempts.append(('audio_default', o1))
+    if platform == 'youtube':
+        o2 = base_ydl_opts()
+        o2.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': output_path,
+            'extractor_args': {'youtube': {'player_client': ['android_vr', 'web_embedded']}},
+        })
+        attempts.append(('audio_alt_clients', o2))
 
-
-# ============================================================
-# gallery-dl (مُصلح: التهيئة الصحيحة عبر config.set)
-# ============================================================
-_gallery_configured = False
-
-
-def _configure_gallery_dl(output_dir):
-    global _gallery_configured
-    from gallery_dl import config as gdconfig
-    if not _gallery_configured:
+    last_error = None
+    for name, opts in attempts:
         try:
-            gdconfig.set(('extractor',), 'base-directory', output_dir)
-            gdconfig.set(('extractor',), 'filename', '{num:03d}_{filename}.{extension}')
-            gdconfig.set(('extractor',), 'sleep-request', 1.0)
-            gdconfig.set(('extractor',), 'user-agent',
-                         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                         '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
-            gdconfig.set(('downloader',), 'retries', 3)
-            gdconfig.set(('downloader',), 'timeout', 30.0)
-            _gallery_configured = True
+            _ydl_try(opts, url)
+            if find_output_file(output_path + '.mp3') or find_output_file(output_path):
+                return True, None
         except Exception as e:
-            logging.warning(f"gallery-dl config failed: {e}")
+            last_error = str(e)
+            logging.warning(f"[{name}] failed: {last_error[:150]}")
+        cleanup_partial(output_path)
+    return False, translate_error(last_error or "Audio download failed")
 
 
+# ============================================================
+# gallery-dl (مُصلح: base-directory لكل استدعاء + بحث متكرر)
+# ============================================================
 def download_gallery(url, output_dir):
-    """تنزيل الصور باستخدام gallery-dl."""
+    """تنزيل الصور باستخدام gallery-dl كخطة احتياطية أخيرة."""
     try:
-        from gallery_dl import job
+        from gallery_dl import job, config as gdconfig
         os.makedirs(output_dir, exist_ok=True)
-        _configure_gallery_dl(output_dir)
+
+        # يجب ضبط المجلد في كل استدعاء — الإعدادات عامة وتبقى بين المهام
+        gdconfig.set(('extractor',), 'base-directory', output_dir)
+        gdconfig.set(('extractor',), 'sleep-request', 1.0)
+        gdconfig.set(('extractor',), 'user-agent', USER_AGENT)
+        if COOKIES_FILE:
+            gdconfig.set(('extractor',), 'cookies', COOKIES_FILE)
+        gdconfig.set(('downloader',), 'retries', 3)
+        gdconfig.set(('downloader',), 'timeout', 30.0)
 
         j = job.DownloadJob(url)
         j.run()
 
-        files = sorted([
-            f for f in os.listdir(output_dir)
-            if os.path.isfile(os.path.join(output_dir, f))
-        ])
+        # gallery-dl ينشئ مجلدات فرعية حسب المنصة — نبحث بشكل متكرر
+        files = []
+        for root, _dirs, names in os.walk(output_dir):
+            for n in names:
+                p = os.path.join(root, n)
+                if os.path.isfile(p) and os.path.getsize(p) > 0:
+                    files.append(p)
+        files.sort()
 
         if not files:
             logging.warning(f"gallery-dl: no files downloaded from {url}")
             return False, []
 
         logging.info(f"gallery-dl: downloaded {len(files)} files")
-        return True, [os.path.join(output_dir, f) for f in files]
+        return True, files[:MAX_SLIDESHOW_IMAGES]
 
     except Exception as e:
         logging.error(f"gallery-dl error: {e}", exc_info=True)
@@ -877,26 +1048,26 @@ def download_gallery(url, output_dir):
 
 
 # ============================================================
-# إرسال منشورات الصور (صور منفصلة + صوت منفصل)
+# إرسال الوسائط
 # ============================================================
+def _mkvid_markup():
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🎬 Make Video (images + audio)", callback_data="mkvid"))
+    return markup
+
+
 def send_photo_post(chat_id, assets):
-    """إرسال منشور صور: الصور صوراً والصوت صوتاً. زر دمج فقط لصورة واحدة."""
-    images = assets.get('images', [])
+    """إرسال منشور صور: الصور ألبومات + الصوت ملف صوتي + زر تحويل لفيديو."""
+    images = [p for p in assets.get('images', []) if os.path.exists(p)]
     audio = assets.get('audio')
     has_audio = bool(audio and os.path.exists(audio))
 
     if len(images) == 1:
-        markup = None
-        if has_audio:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🎬 Make Video", callback_data="mkvid"))
         try:
             with open(images[0], 'rb') as f:
-                if markup:
-                    bot.send_photo(chat_id, f, caption="📷 Photo post",
-                                   reply_markup=markup, timeout=120)
-                else:
-                    bot.send_photo(chat_id, f, caption="📷 Photo post", timeout=120)
+                bot.send_photo(chat_id, f, caption="📷 Photo post",
+                               reply_markup=_mkvid_markup() if has_audio else None,
+                               timeout=120)
         except Exception as e:
             logging.error(f"send_photo failed: {e}")
             try:
@@ -904,143 +1075,91 @@ def send_photo_post(chat_id, assets):
                     bot.send_document(chat_id, f, timeout=120)
             except Exception as e2:
                 logging.error(f"send_document fallback failed: {e2}")
-
-    else:
-        media = []
-        for i, p in enumerate(images[:10]):
-            try:
-                with open(p, 'rb') as f:
-                    media.append(types.InputMediaPhoto(
-                        f.read(), caption='📷 Photo post' if i == 0 else ''))
-            except Exception as e:
-                logging.error(f"read album image failed: {e}")
-        if media:
-            try:
-                bot.send_media_group(chat_id, media, timeout=180)
-            except Exception as e:
-                logging.error(f"send_media_group failed: {e}")
-                for p in images[:10]:
-                    try:
-                        with open(p, 'rb') as f:
-                            bot.send_photo(chat_id, f, timeout=120)
-                    except Exception:
-                        pass
-        if len(images) > 10:
-            bot.send_message(chat_id, f"Sent 10 of {len(images)} images.")
+    elif images:
+        # ألبومات بحد أقصى 10 صور للمجموعة — نرسل الكل على دفعات
+        for chunk_start in range(0, len(images), 10):
+            chunk = images[chunk_start:chunk_start + 10]
+            media = []
+            for i, p in enumerate(chunk):
+                try:
+                    with open(p, 'rb') as f:
+                        caption = '📷 Photo post' if (chunk_start == 0 and i == 0) else ''
+                        media.append(types.InputMediaPhoto(f.read(), caption=caption))
+                except Exception as e:
+                    logging.error(f"read album image failed: {e}")
+            if media:
+                try:
+                    bot.send_media_group(chat_id, media, timeout=180)
+                except Exception as e:
+                    logging.error(f"send_media_group failed: {e}")
+                    for p in chunk:
+                        try:
+                            with open(p, 'rb') as f:
+                                bot.send_photo(chat_id, f, timeout=120)
+                        except Exception:
+                            pass
 
     if has_audio:
         try:
             with open(audio, 'rb') as a:
-                bot.send_audio(chat_id, a, caption="🎵 Audio", timeout=180)
+                bot.send_audio(chat_id, a, caption="🎵 Audio",
+                               reply_markup=_mkvid_markup() if len(images) > 1 else None,
+                               timeout=180)
         except Exception as e:
             logging.error(f"send audio failed: {e}")
 
 
-# ============================================================
-# process_download
-# ============================================================
-def process_download(task: dict):
-    chat_id = task['chat_id']
-    user_id = task['user_id']
-    url = task['url']
+def send_bundle(chat_id, user_id, url, bundle: MediaBundle, workdir: str):
+    """إرسال نتيجة أي استراتيجية (فيديوهات + صور + صوت)."""
+    sent = False
 
-    temp = f"/tmp/v_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
-    temp_dir = f"/tmp/g_{user_id}_{uuid.uuid4().hex[:8]}"
-    ss_dir = f"/tmp/ss_{user_id}_{uuid.uuid4().hex[:8]}"
-
-    final = None
-
-    try:
-        # 1) المحاولة الأساسية: فيديو (المسار القديم الذي كان يعمل)
-        ok, err = download_video(url, temp)
-
-        if not ok:
-            # 2) هل المنشور صور؟ (استخراج خفيف بمحاولات قليلة)
-            logging.info("video download failed, checking if this is a photo post...")
-            data, ss_err = extract_slideshow(url)
-
-            if data:
-                assets, a_err = download_slideshow_assets(url, data, ss_dir)
-                if assets:
-                    _store_user_pending(user_id, url, assets=assets)
-                    send_photo_post(chat_id, assets)
-                    return
-                else:
-                    bot.send_message(
-                        chat_id,
-                        "This post contains photos, but I couldn't download them.\n\n"
-                        f"Reason: {a_err or 'unknown'}"
-                    )
-                    return
-
-            # 3) ليس منشور صور مؤكد → gallery-dl
-            logging.info(f"not a detectable photo post ({ss_err}), trying gallery-dl...")
-            ok2, files = download_gallery(url, temp_dir)
-            if ok2 and files:
-                send_gallery(chat_id, files)
-                return
-
-            # 4) فشل نهائي — أخبر المستخدم بالسبب بوضوح
-            bot.send_message(chat_id, f"Download failed.\n\n{err}")
-            return
-
-        final = find_output_file(temp)
-        if not final:
-            bot.send_message(chat_id, "Download seemed to succeed but the file was not created.")
-            return
-
-        if os.path.getsize(final) == 0:
-            bot.send_message(chat_id, "Downloaded file is empty. The platform may have blocked the request.")
-            return
-
-        size_mb = os.path.getsize(final) / (1024 * 1024)
-
+    for vp in bundle.videos[:3]:
+        if not os.path.exists(vp):
+            continue
+        size_mb = os.path.getsize(vp) / (1024 * 1024)
         if size_mb > 50:
             bot.send_message(
                 chat_id,
-                f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).\n"
-                f"Use the options below to download a lower quality."
+                f"Video size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).\n"
+                f"Use the options below to pick a lower quality."
             )
-            _store_user_pending(user_id, url)
-            send_more_options(chat_id, user_id, url)
-            return
-
-        _store_user_pending(user_id, url)
-
+            continue
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("More", callback_data="more"))
-
-        with open(final, 'rb') as v:
-            bot.send_video(
-                chat_id, v,
-                reply_markup=markup,
-                timeout=180,
-                supports_streaming=True
-            )
-
-        threading.Thread(
-            target=_background_fetch_formats,
-            args=(user_id, url),
-            daemon=True
-        ).start()
-
-    except Exception as e:
-        logging.error(f"process_download error: {e}", exc_info=True)
         try:
-            bot.send_message(chat_id, f"Technical error: {type(e).__name__}")
-        except Exception:
-            pass
-    finally:
-        cleanup_file(temp)
-        if final and final != temp:
-            cleanup_file(final)
-        cleanup_dir(temp_dir)
-        # ملاحظة: لا نحذف ss_dir هنا — ملفاته محفوظة لزر "Make Video"
-        # وتُنظَّف عبر TTL (ساعة) أو كنس /tmp (ساعتان)
+            with open(vp, 'rb') as v:
+                bot.send_video(chat_id, v, reply_markup=markup, timeout=180,
+                               supports_streaming=True,
+                               caption=bundle.title[:1000] if bundle.title else None)
+            sent = True
+        except Exception as e:
+            logging.error(f"send_bundle video failed: {e}")
+            try:
+                with open(vp, 'rb') as v:
+                    bot.send_document(chat_id, v, timeout=180)
+                sent = True
+            except Exception as e2:
+                logging.error(f"send_bundle video as document failed: {e2}")
+
+    if bundle.images:
+        assets = {'images': bundle.images, 'videos': [], 'audio': bundle.audio,
+                  'dir': workdir, 'duration': bundle.duration}
+        _store_user_pending(user_id, url, assets=assets)
+        send_photo_post(chat_id, assets)
+        sent = True
+    elif bundle.audio and not bundle.videos:
+        try:
+            with open(bundle.audio, 'rb') as a:
+                bot.send_audio(chat_id, a, timeout=180)
+            sent = True
+        except Exception as e:
+            logging.error(f"send_bundle audio failed: {e}")
+
+    return sent
 
 
 def send_gallery(chat_id, files):
-    """إرسال الصور مع دعم صيغ متعددة."""
+    """إرسال ملفات gallery-dl (صور وفيديوهات)."""
     if not files:
         bot.send_message(chat_id, "No images found.")
         return
@@ -1052,7 +1171,7 @@ def send_gallery(chat_id, files):
     videos = [f for f in files if f.lower().endswith(video_exts)]
 
     sent_count = 0
-    for f in images[:10]:
+    for f in images[:MAX_SLIDESHOW_IMAGES]:
         try:
             size_mb = os.path.getsize(f) / (1024 * 1024)
             with open(f, 'rb') as img:
@@ -1066,13 +1185,14 @@ def send_gallery(chat_id, files):
 
     for f in videos[:3]:
         try:
+            size_mb = os.path.getsize(f) / (1024 * 1024)
+            if size_mb > 50:
+                bot.send_message(chat_id, f"A video clip ({format_size(size_mb)}) exceeds 50 MB, skipped.")
+                continue
             with open(f, 'rb') as v:
                 bot.send_video(chat_id, v, timeout=180, supports_streaming=True)
         except Exception as e:
             logging.error(f"send_video from gallery failed: {e}")
-
-    if len(images) > 10:
-        bot.send_message(chat_id, f"Sent 10 of {len(images)} images.")
 
     if sent_count == 0 and not videos:
         bot.send_message(chat_id, "No viewable media found.")
@@ -1104,6 +1224,139 @@ def send_more_options(chat_id, user_id, url):
 
 
 # ============================================================
+# process_download — المحرك الرئيسي متعدد الطبقات
+# ============================================================
+def process_download(task: dict):
+    chat_id = task['chat_id']
+    user_id = task['user_id']
+    url = task['url']
+    platform = classify_url(url)
+
+    temp = f"/tmp/v_{user_id}_{uuid.uuid4().hex[:8]}.mp4"
+    temp_dir = f"/tmp/g_{user_id}_{uuid.uuid4().hex[:8]}"
+    ss_dir = f"/tmp/ss_{user_id}_{uuid.uuid4().hex[:8]}"
+
+    final = None
+
+    try:
+        # ── طبقة 1 (إكس/تويتر): API مباشر — يدعم الصور والفيديو بدون تسجيل ──
+        if platform == 'twitter':
+            bundle = try_fxtwitter(url, ss_dir)
+            if bundle:
+                _store_user_pending(user_id, url)
+                if send_bundle(chat_id, user_id, url, bundle, ss_dir):
+                    threading.Thread(target=_background_fetch_formats,
+                                     args=(user_id, url), daemon=True).start()
+                    return
+
+        # ── طبقة 2: تنزيل الفيديو عبر yt-dlp (المسار الأساسي) ──
+        ok, err = download_video(url, temp, platform)
+
+        if ok:
+            final = find_output_file(temp)
+            if not final:
+                bot.send_message(chat_id, "Download seemed to succeed but the file was not created.")
+                return
+
+            if os.path.getsize(final) == 0:
+                bot.send_message(chat_id, "Downloaded file is empty. The platform may have blocked the request.")
+                return
+
+            size_mb = os.path.getsize(final) / (1024 * 1024)
+
+            if size_mb > 50:
+                bot.send_message(
+                    chat_id,
+                    f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).\n"
+                    f"Use the options below to download a lower quality."
+                )
+                _store_user_pending(user_id, url)
+                send_more_options(chat_id, user_id, url)
+                return
+
+            _store_user_pending(user_id, url)
+            _clear_user_assets(user_id)
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("More", callback_data="more"))
+
+            with open(final, 'rb') as v:
+                bot.send_video(
+                    chat_id, v,
+                    reply_markup=markup,
+                    timeout=180,
+                    supports_streaming=True
+                )
+
+            threading.Thread(
+                target=_background_fetch_formats,
+                args=(user_id, url),
+                daemon=True
+            ).start()
+            return
+
+        # ── طبقة 3 (تيك توك): tikwm API — صور + موسيقى أو فيديو HD ──
+        if platform == 'tiktok':
+            logging.info("yt-dlp failed for TikTok, trying tikwm API...")
+            bundle = try_tikwm(url, ss_dir)
+            if bundle:
+                _store_user_pending(user_id, url)
+                if send_bundle(chat_id, user_id, url, bundle, ss_dir):
+                    threading.Thread(target=_background_fetch_formats,
+                                     args=(user_id, url), daemon=True).start()
+                    return
+
+        # ── طبقة 4: هل المنشور صور؟ استخراج عبر yt-dlp ──
+        logging.info("checking if this is a photo post via yt-dlp...")
+        data, ss_err = extract_slideshow(url)
+
+        if data:
+            assets, a_err = download_slideshow_assets(url, data, ss_dir)
+            if assets:
+                _store_user_pending(user_id, url, assets=assets)
+                for cv in assets.get('videos', []):
+                    try:
+                        size_mb = os.path.getsize(cv) / (1024 * 1024)
+                        if size_mb <= 50:
+                            with open(cv, 'rb') as v:
+                                bot.send_video(chat_id, v, timeout=180, supports_streaming=True)
+                    except Exception as e:
+                        logging.error(f"send carousel clip failed: {e}")
+                send_photo_post(chat_id, assets)
+                return
+            logging.warning(f"slideshow asset download failed: {a_err}")
+
+        # ── طبقة 5: gallery-dl (صور أي منصة) ──
+        logging.info("trying gallery-dl as last resort...")
+        ok2, files = download_gallery(url, temp_dir)
+        if ok2 and files:
+            _store_user_pending(user_id, url)
+            send_gallery(chat_id, files)
+            return
+
+        # ── فشل نهائي ──
+        hint = ""
+        if platform == 'instagram' and not COOKIES_FILE:
+            hint = ("\n\nTip: Instagram often blocks server IPs. The bot owner can enable it "
+                    "by adding Instagram cookies (YTDLP_COOKIES).")
+        bot.send_message(chat_id, f"Download failed.\n\n{err}{hint}")
+
+    except Exception as e:
+        logging.error(f"process_download error: {e}", exc_info=True)
+        try:
+            bot.send_message(chat_id, f"Technical error: {type(e).__name__}")
+        except Exception:
+            pass
+    finally:
+        cleanup_file(temp)
+        if final and final != temp:
+            cleanup_file(final)
+        cleanup_dir(temp_dir)
+        # ملاحظة: لا نحذف ss_dir — ملفاته محفوظة لزر "Make Video"
+        # وتُنظَّف عبر TTL (ساعة) أو كنس /tmp (ساعتان)
+
+
+# ============================================================
 # Handlers
 # ============================================================
 @bot.message_handler(commands=['start', 'help'])
@@ -1112,20 +1365,18 @@ def welcome(message):
     text = (
         "<b>yt-dlp</b>\n"
         "Professional Media Downloading Service\n\n"
-        "Built on the powerful yt-dlp engine, this service provides fast and reliable "
-        "media extraction from a wide range of supported platforms.\n\n"
-        "Download videos, audio, images, posts, and supported media in the available "
-        "quality and formats.\n\n"
-        "<b>FEATURES</b>\n"
-        "• High-quality video and audio extraction\n"
-        "• Multiple formats and quality options\n"
-        "• Photo posts: images and audio delivered separately\n"
-        "• Single-photo posts can be merged into a video with one tap\n"
-        "• Direct file delivery\n"
-        "• Fast and reliable processing\n"
-        "• Broad platform compatibility\n\n"
+        "Built on a multi-layer download engine with automatic fallbacks for "
+        "maximum reliability across platforms.\n\n"
+        "<b>SUPPORTED CONTENT</b>\n"
+        "• Videos in the best available quality\n"
+        "• Photo posts &amp; carousels (TikTok, Instagram, X) — delivered as albums\n"
+        "• Slideshow audio delivered separately, with one-tap video merge\n"
+        "• Audio extraction (MP3)\n\n"
+        "<b>PLATFORMS</b>\n"
+        "YouTube, TikTok, Instagram, X/Twitter, Facebook, Reddit, Pinterest, "
+        "Vimeo, Twitch, SoundCloud, and many more.\n\n"
         "<b>HOW TO USE</b>\n"
-        "Send a supported media URL and the service will process it automatically."
+        "Send any supported media URL and the service will handle the rest."
     )
     PHOTO_FILE_ID = "AgACAgQAAxkBAAM7ar1x_-DZJG9VDd5NRPy2xPtsreoAAs4SaxsCGulR6CNW3Nej7kwBAAMCAAN5AAM9BA"
 
@@ -1168,7 +1419,7 @@ def handle_more(call):
 
 @bot.callback_query_handler(func=lambda call: call.data == 'mkvid')
 def handle_mkvid(call):
-    """دمج صورة + صوت منشور صور في فيديو (زر Make Video)."""
+    """دمج صور + صوت منشور في فيديو (زر Make Video)."""
     user_id = call.from_user.id
     chat_id = call.message.chat.id
 
@@ -1188,16 +1439,26 @@ def handle_mkvid(call):
         audio = audio if audio and os.path.exists(audio) else None
 
         if not images or not audio:
-            # الملفات لم تعد موجودة (تنظيف/إعادة تشغيل) — أعد تحميلها
-            ss_data, ss_err = extract_slideshow(url)
-            if not ss_data:
-                bot.send_message(chat_id,
-                                 f"Couldn't fetch the post again.\n\n{translate_error(ss_err)}")
-                return
-            new_assets, a_err = download_slideshow_assets(url, ss_data, assets.get('dir') or f"/tmp/ss_{user_id}_{uuid.uuid4().hex[:8]}")
+            # الملفات لم تعد موجودة — أعد تحميلها
+            platform = classify_url(url)
+            new_assets = None
+            if platform == 'tiktok':
+                bundle = try_tikwm(url, assets.get('dir') or f"/tmp/ss_{user_id}_{uuid.uuid4().hex[:8]}")
+                if bundle and bundle.images:
+                    new_assets = {'images': bundle.images, 'videos': [],
+                                  'audio': bundle.audio, 'dir': assets.get('dir'),
+                                  'duration': bundle.duration}
             if not new_assets:
-                bot.send_message(chat_id, f"Couldn't re-download the media.\n\n{a_err or 'unknown'}")
-                return
+                ss_data, ss_err = extract_slideshow(url)
+                if not ss_data:
+                    bot.send_message(chat_id,
+                                     f"Couldn't fetch the post again.\n\n{translate_error(ss_err)}")
+                    return
+                new_assets, a_err = download_slideshow_assets(
+                    url, ss_data, assets.get('dir') or f"/tmp/ss_{user_id}_{uuid.uuid4().hex[:8]}")
+                if not new_assets:
+                    bot.send_message(chat_id, f"Couldn't re-download the media.\n\n{a_err or 'unknown'}")
+                    return
             assets = new_assets
             _store_user_pending(user_id, url, assets=assets)
             images = assets['images']
@@ -1331,11 +1592,14 @@ def handle_audio(call):
 @bot.message_handler(func=lambda m: True)
 def handle(message):
     logging.info(f"Got message: {message.text}")
-    url = message.text.strip()
+    text = (message.text or '').strip()
 
-    if not re.match(r'https?://', url):
+    # استخراج أول رابط من الرسالة حتى لو أرسل المستخدم نصاً معه
+    m = re.search(r'https?://[^\s<>"\']+', text)
+    if not m:
         bot.reply_to(message, "Please send a valid URL starting with http:// or https://")
         return
+    url = m.group(0).rstrip('.,)]}')
 
     if not is_allowed_url(url):
         bot.reply_to(message, "This domain is not supported.")
