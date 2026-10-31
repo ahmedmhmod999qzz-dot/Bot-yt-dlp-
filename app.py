@@ -1197,3 +1197,274 @@ def _process_download_internal(task: dict):
             shutil.rmtree(task_dir, ignore_errors=True)
 
 # =====
+# ============================================================
+# Handlers (Adapted for the new task_id system)
+# ============================================================
+@bot.message_handler(commands=['start', 'help'])
+def welcome(message):
+    logging.info(f"Got /start from {message.chat.id}")
+    text = (
+        "<b>yt-dlp</b>\n"
+        "Professional Media Downloading Service\n\n"
+        "Built on a multi-layer download engine with automatic fallbacks for "
+        "maximum reliability across platforms.\n\n"
+        "<b>SUPPORTED CONTENT</b>\n"
+        "• Videos in the best available quality\n"
+        "• Photo posts &amp; carousels (TikTok, Instagram, X) — delivered as albums\n"
+        "• Slideshow audio delivered separately, with one-tap video merge\n"
+        "• Audio extraction (MP3)\n\n"
+        "<b>PLATFORMS</b>\n"
+        "YouTube, TikTok, Instagram, X/Twitter, Facebook, Reddit, Pinterest, "
+        "Vimeo, Twitch, SoundCloud, and many more.\n\n"
+        "<b>HOW TO USE</b>\n"
+        "Send any supported media URL and the service will handle the rest."
+    )
+    PHOTO_FILE_ID = "AgACAgQAAxkBAAM7ar1x_-DZJG9VDd5NRPy2xPtsreoAAs4SaxsCGulR6CNW3Nej7kwBAAMCAAN5AAM9BA"
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("⚙ Settings", callback_data="dev"),
+        types.InlineKeyboardButton("❓ Help", callback_data="dev"),
+    )
+    markup.add(
+        types.InlineKeyboardButton("ℹ About", callback_data="dev"),
+        types.InlineKeyboardButton("📊 Status", callback_data="dev"),
+    )
+
+    try:
+        bot.send_photo(message.chat.id, PHOTO_FILE_ID, caption=text, reply_markup=markup)
+    except Exception as e:
+        logging.error(f"send_photo failed: {e}")
+        bot.reply_to(message, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'dev')
+def handle_dev(call):
+    bot.answer_callback_query(call.id, "Under development", show_alert=False)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('more|'))
+def handle_more(call):
+    parts = call.data.split('|')
+    task_id = parts[1] if len(parts) > 1 else None
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    
+    url = _get_task_url(task_id)
+
+    bot.answer_callback_query(call.id)
+
+    if not url:
+        bot.send_message(chat_id, "Session expired. Please send the URL again.")
+        return
+
+    send_more_options(chat_id, user_id, url, task_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mkvid|'))
+def handle_mkvid(call):
+    parts = call.data.split('|')
+    task_id = parts[1] if len(parts) > 1 else None
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+
+    bot.answer_callback_query(call.id, "Making video...")
+
+    try:
+        data = _get_task_pending(task_id)
+        if not data or not data.get('assets'):
+            bot.send_message(chat_id, "Session expired. Please send the link again.")
+            return
+
+        assets = data['assets']
+        url = data['url']
+
+        images = [p for p in assets.get('images', []) if os.path.exists(p)]
+        audio = assets.get('audio')
+        audio = audio if audio and os.path.exists(audio) else None
+
+        if not images or not audio:
+            bot.send_message(chat_id, "Media files are missing or expired from the server. Send the link again.")
+            return
+
+        out_path = os.path.join(assets['dir'], f'merged_{uuid.uuid4().hex[:6]}.mp4')
+        if not merge_slideshow(images, audio, out_path, total_duration=assets.get('duration')):
+            bot.send_message(chat_id, "Video processing failed. Please try again.")
+            return
+
+        size_mb = os.path.getsize(out_path) / (1024 * 1024)
+        if size_mb > 50:
+            bot.send_message(chat_id, f"Merged video ({format_size(size_mb)}) exceeds Telegram's 50 MB limit.")
+            return
+
+        try:
+            with open(out_path, 'rb') as v:
+                bot.send_video(chat_id, v, timeout=180, supports_streaming=True)
+        except Exception as e:
+            logging.error(f"send merged video failed: {e}")
+            bot.send_message(chat_id, "Couldn't send the video. Please try again.")
+
+    except Exception as e:
+        logging.error(f"handle_mkvid error: {e}", exc_info=True)
+        try:
+            bot.send_message(chat_id, f"Technical error: {type(e).__name__}")
+        except:
+            pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('q|'))
+def handle_quality(call):
+    try:
+        parts = call.data.split('|')
+        if len(parts) < 4:
+            bot.answer_callback_query(call.id, "Invalid data.")
+            return
+        
+        task_id = parts[1]
+        fmt_id = parts[2]
+        height = parts[3]
+
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        url = _get_task_url(task_id)
+
+        bot.answer_callback_query(call.id, "Processing...")
+
+        if not url:
+            bot.send_message(chat_id, "Session expired.")
+            return
+
+        temp = f"/tmp/q_{task_id}.mp4"
+        final = None
+
+        try:
+            ok, err = download_specific_format(url, temp, fmt_id, height=height)
+            if not ok:
+                bot.send_message(chat_id, f"Download failed.\n\n{err}")
+                return
+
+            final = find_output_file(temp)
+            if not final:
+                bot.send_message(chat_id, "File was not created.")
+                return
+
+            size_mb = os.path.getsize(final) / (1024 * 1024)
+
+            if size_mb > 50:
+                bot.send_message(chat_id, f"File size ({format_size(size_mb)}) exceeds Telegram limit (50 MB).")
+                return
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("More", callback_data=f"more|{task_id}"))
+
+            with open(final, 'rb') as v:
+                bot.send_video(chat_id, v, reply_markup=markup, timeout=180, supports_streaming=True)
+        finally:
+            cleanup_file(temp)
+            if final and final != temp:
+                cleanup_file(final)
+    except Exception as e:
+        logging.error(f"handle_quality error: {e}", exc_info=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('a|'))
+def handle_audio(call):
+    try:
+        parts = call.data.split('|')
+        task_id = parts[1] if len(parts) > 1 else None
+        
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        url = _get_task_url(task_id)
+
+        bot.answer_callback_query(call.id, "Processing...")
+
+        if not url:
+            bot.send_message(chat_id, "Session expired.")
+            return
+
+        temp = f"/tmp/a_{task_id}"
+        final = None
+
+        try:
+            ok, err = download_audio(url, temp)
+            if not ok:
+                bot.send_message(chat_id, f"Download failed.\n\n{err}")
+                return
+
+            final = find_output_file(temp + ".mp3") or find_output_file(temp)
+            if not final:
+                bot.send_message(chat_id, "File was not created.")
+                return
+
+            with open(final, 'rb') as a:
+                bot.send_audio(chat_id, a, timeout=180)
+        finally:
+            cleanup_file(temp + ".mp3")
+            cleanup_file(temp)
+            if final and final not in (temp, temp + ".mp3"):
+                cleanup_file(final)
+    except Exception as e:
+        logging.error(f"handle_audio error: {e}", exc_info=True)
+
+@bot.message_handler(func=lambda m: True)
+def handle(message):
+    logging.info(f"Got message: {message.text}")
+    text = (message.text or '').strip()
+
+    m = re.search(r'https?://[^\s<>"\']+', text)
+    if not m:
+        bot.reply_to(message, "Please send a valid URL starting with http:// or https://")
+        return
+    url = m.group(0).rstrip('.,)]}')
+
+    if not is_allowed_url(url):
+        bot.reply_to(message, "This domain is not supported.")
+        return
+
+    allowed, wait = check_rate_limit(message.from_user.id)
+    if not allowed:
+        bot.reply_to(message, f"Rate limit exceeded (5 links per minute).\nTry again in {wait} seconds.")
+        return
+
+    try:
+        msg = bot.reply_to(message, "Received. Processing...")
+        task = {
+            'task_id': uuid.uuid4().hex,
+            'chat_id': message.chat.id,
+            'user_id': message.from_user.id,
+            'url': url,
+            'msg_id': msg.message_id,
+        }
+        download_queue.put_nowait(task)
+    except queue.Full:
+        bot.reply_to(message, "Server busy. Try again shortly.")
+
+# ============================================================
+# Flask & Run
+# ============================================================
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "ok",
+        "queue_size": download_queue.qsize(),
+    }), 200
+
+@app.route('/')
+def index():
+    return "Bot is running!", 200
+
+def run_bot():
+    try:
+        bot.remove_webhook()
+        logging.info("Old webhook removed.")
+    except Exception as e:
+        logging.warning(f"remove_webhook: {e}")
+    logging.info("=== Starting polling ===")
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "2"))
+for i in range(NUM_WORKERS):
+    threading.Thread(target=download_worker, args=(i + 1,), daemon=True).start()
+
+threading.Thread(target=run_bot, daemon=True).start()
+threading.Thread(target=_cleanup_loop, daemon=True).start()
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
