@@ -873,13 +873,17 @@ def download_slideshow_assets(url: str, data: dict, workdir: str):
             opts.update({'format': 'bestaudio/best', 'outtmpl': audio_dest})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
-            audio_path = find_output_file(audio_dest) or find_output_file(audio_dest + '.m4a')
+            
+            # التعديل هنا: البحث عن ملف الصوت داخل المجلد الصحيح (workdir) بدلاً من /tmp/
+            for f in os.listdir(workdir):
+                if f.startswith('audio') and os.path.isfile(os.path.join(workdir, f)):
+                    audio_path = os.path.join(workdir, f)
+                    break
         except Exception as e:
             logging.warning(f"slideshow audio via yt-dlp failed: {str(e)[:120]}")
 
     return {'images': image_paths, 'videos': video_paths, 'audio': audio_path,
             'dir': workdir, 'duration': data.get('duration')}, None
-
 
 # ============================================================
 # تنزيل الفيديو: محاولات متعددة حسب المنصة
@@ -1099,12 +1103,13 @@ def send_photo_post(chat_id, assets):
     audio = assets.get('audio')
     has_audio = bool(audio and os.path.exists(audio))
 
-    # 1. إرسال الصوت أولاً (حسب طلبك)
+    # 1. إرسال الصوت أولاً
     if has_audio:
         try:
             with open(audio, 'rb') as a:
+                # التعديل هنا: إظهار زر دمج الفيديو إذا كان هناك صورة واحدة على الأقل
                 bot.send_audio(chat_id, a, caption="🎵 Audio",
-                               reply_markup=_mkvid_markup() if len(images) > 1 else None,
+                               reply_markup=_mkvid_markup() if len(images) >= 1 else None,
                                timeout=180)
         except Exception as e:
             logging.error(f"send audio failed: {e}")
@@ -1128,25 +1133,35 @@ def send_photo_post(chat_id, assets):
         for chunk_start in range(0, len(images), 10):
             chunk = images[chunk_start:chunk_start + 10]
             media = []
+            open_files = [] # التعديل هنا: إبقاء الملفات مفتوحة في الذاكرة حتى يكتمل إرسال الألبوم
             for i, p in enumerate(chunk):
                 try:
-                    with open(p, 'rb') as f:
-                        caption = '📷 Photo post' if (chunk_start == 0 and i == 0) else ''
-                        media.append(types.InputMediaPhoto(f.read(), caption=caption))
+                    f = open(p, 'rb')
+                    open_files.append(f)
+                    caption = '📷 Photo post' if (chunk_start == 0 and i == 0) else ''
+                    media.append(types.InputMediaPhoto(f, caption=caption))
                 except Exception as e:
                     logging.error(f"read album image failed: {e}")
+            
             if media:
                 try:
                     bot.send_media_group(chat_id, media, timeout=180)
                 except Exception as e:
                     logging.error(f"send_media_group failed: {e}")
-                    for p in chunk:
+                    # احتياطي: إذا فشل الألبوم لسبب ما، نرسلها كصور متتالية
+                    for f in open_files:
                         try:
-                            with open(p, 'rb') as f:
-                                bot.send_photo(chat_id, f, timeout=120)
+                            f.seek(0)
+                            bot.send_photo(chat_id, f, timeout=120)
                         except Exception:
                             pass
-
+            
+            # إغلاق الملفات بأمان بعد انتهاء الإرسال
+            for f in open_files:
+                try:
+                    f.close()
+                except:
+                    pass
 def send_bundle(chat_id, user_id, url, bundle: MediaBundle, workdir: str):
     """إرسال نتيجة أي استراتيجية (فيديوهات + صور + صوت)."""
     sent = False
