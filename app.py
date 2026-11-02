@@ -1094,11 +1094,22 @@ def _mkvid_markup():
 
 
 def send_photo_post(chat_id, assets):
-    """إرسال منشور صور: الصور ألبومات + الصوت ملف صوتي + زر تحويل لفيديو."""
+    """إرسال منشور صور: الصوت أولاً ثم الصور ألبومات + زر تحويل لفيديو."""
     images = [p for p in assets.get('images', []) if os.path.exists(p)]
     audio = assets.get('audio')
     has_audio = bool(audio and os.path.exists(audio))
 
+    # 1. إرسال الصوت أولاً (حسب طلبك)
+    if has_audio:
+        try:
+            with open(audio, 'rb') as a:
+                bot.send_audio(chat_id, a, caption="🎵 Audio",
+                               reply_markup=_mkvid_markup() if len(images) > 1 else None,
+                               timeout=180)
+        except Exception as e:
+            logging.error(f"send audio failed: {e}")
+
+    # 2. إرسال الصور بعد الصوت
     if len(images) == 1:
         try:
             with open(images[0], 'rb') as f:
@@ -1135,16 +1146,6 @@ def send_photo_post(chat_id, assets):
                                 bot.send_photo(chat_id, f, timeout=120)
                         except Exception:
                             pass
-
-    if has_audio:
-        try:
-            with open(audio, 'rb') as a:
-                bot.send_audio(chat_id, a, caption="🎵 Audio",
-                               reply_markup=_mkvid_markup() if len(images) > 1 else None,
-                               timeout=180)
-        except Exception as e:
-            logging.error(f"send audio failed: {e}")
-
 
 def send_bundle(chat_id, user_id, url, bundle: MediaBundle, workdir: str):
     """إرسال نتيجة أي استراتيجية (فيديوهات + صور + صوت)."""
