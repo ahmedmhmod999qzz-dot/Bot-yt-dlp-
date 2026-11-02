@@ -847,13 +847,15 @@ def download_slideshow_assets(url: str, data: dict, workdir: str):
     for idx, img_url in enumerate(data.get('images') or []):
         dest = os.path.join(workdir, f'img_{idx:03d}.jpg')
         if fetch_file(img_url, dest, referer=url):
-            image_paths.append(dest)
+            if os.path.getsize(dest) > 0: # التأكد أن الصورة ليست تالفة
+                image_paths.append(dest)
 
     video_paths = []
     for idx, clip_url in enumerate(data.get('clips') or []):
         dest = os.path.join(workdir, f'clip_{idx:03d}.mp4')
         if fetch_file(clip_url, dest, referer=url):
-            video_paths.append(dest)
+            if os.path.getsize(dest) > 0:
+                video_paths.append(dest)
 
     if not image_paths and not video_paths:
         return None, "Could not download any of the post media."
@@ -862,29 +864,39 @@ def download_slideshow_assets(url: str, data: dict, workdir: str):
     if data.get('audio_url'):
         audio_dest = os.path.join(workdir, 'audio.m4a')
         if fetch_file(data['audio_url'], audio_dest, referer=url):
-            audio_path = audio_dest
+            if os.path.getsize(audio_dest) > 0:
+                audio_path = audio_dest
 
     if not audio_path and image_paths:
-        # احتياطي: الصوت عبر yt-dlp (يتعامل مع الروابط الموقّعة)
+        # احتياطي: تحميل الصوت عبر yt-dlp وتحويله إجبارياً إلى MP3
         try:
             audio_dest = os.path.join(workdir, 'audio')
             opts = base_ydl_opts()
             opts['retries'] = 3
-            opts.update({'format': 'bestaudio/best', 'outtmpl': audio_dest})
+            opts.update({
+                'format': 'bestaudio/best',
+                'outtmpl': audio_dest,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+            })
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
             
-            # التعديل هنا: البحث عن ملف الصوت داخل المجلد الصحيح (workdir) بدلاً من /tmp/
+            # البحث عن ملف الـ MP3 الذي تم استخراجه
             for f in os.listdir(workdir):
-                if f.startswith('audio') and os.path.isfile(os.path.join(workdir, f)):
-                    audio_path = os.path.join(workdir, f)
-                    break
+                if f.startswith('audio') and f.endswith('.mp3'):
+                    p = os.path.join(workdir, f)
+                    if os.path.getsize(p) > 0:
+                        audio_path = p
+                        break
         except Exception as e:
             logging.warning(f"slideshow audio via yt-dlp failed: {str(e)[:120]}")
 
     return {'images': image_paths, 'videos': video_paths, 'audio': audio_path,
             'dir': workdir, 'duration': data.get('duration')}, None
-
 # ============================================================
 # تنزيل الفيديو: محاولات متعددة حسب المنصة
 # ============================================================
@@ -1096,18 +1108,26 @@ def _mkvid_markup():
     markup.add(types.InlineKeyboardButton("🎬 Make Video (images + audio)", callback_data="mkvid"))
     return markup
 
-
 def send_photo_post(chat_id, assets):
     """إرسال منشور صور: الصوت أولاً ثم الصور ألبومات + زر تحويل لفيديو."""
-    images = [p for p in assets.get('images', []) if os.path.exists(p)]
+    # تصفية الصور التالفة
+    images = [p for p in assets.get('images', []) if os.path.exists(p) and os.path.getsize(p) > 0]
     audio = assets.get('audio')
-    has_audio = bool(audio and os.path.exists(audio))
+    has_audio = bool(audio and os.path.exists(audio) and os.path.getsize(audio) > 0)
 
     # 1. إرسال الصوت أولاً
     if has_audio:
         try:
+            # إجبار الامتداد على أن يكون مدعوماً لتليجرام لتجنب رفض السيرفر
+            valid_exts = ('.mp3', '.m4a', '.ogg', '.wav')
+            if not any(audio.lower().endswith(ext) for ext in valid_exts):
+                new_audio = audio + '.mp3'
+                os.rename(audio, new_audio)
+                audio = new_audio
+                assets['audio'] = audio
+
             with open(audio, 'rb') as a:
-                # التعديل هنا: إظهار زر دمج الفيديو إذا كان هناك صورة واحدة على الأقل
+                # إظهار زر دمج الفيديو إذا كان هناك صورة واحدة على الأقل
                 bot.send_audio(chat_id, a, caption="🎵 Audio",
                                reply_markup=_mkvid_markup() if len(images) >= 1 else None,
                                timeout=180)
@@ -1123,17 +1143,22 @@ def send_photo_post(chat_id, assets):
                                timeout=120)
         except Exception as e:
             logging.error(f"send_photo failed: {e}")
-            try:
-                with open(images[0], 'rb') as f:
-                    bot.send_document(chat_id, f, timeout=120)
-            except Exception as e2:
-                logging.error(f"send_document fallback failed: {e2}")
     elif images:
-        # ألبومات بحد أقصى 10 صور للمجموعة — نرسل الكل على دفعات
+        # ألبومات بحد أقصى 10 صور للمجموعة
         for chunk_start in range(0, len(images), 10):
             chunk = images[chunk_start:chunk_start + 10]
+            
+            # تليجرام يرفض الألبوم إذا كان يحتوي على صورة واحدة فقط، نرسلها كصورة عادية
+            if len(chunk) == 1:
+                try:
+                    with open(chunk[0], 'rb') as f:
+                        bot.send_photo(chat_id, f, caption="📷 Photo post", timeout=120)
+                except:
+                    pass
+                continue
+
             media = []
-            open_files = [] # التعديل هنا: إبقاء الملفات مفتوحة في الذاكرة حتى يكتمل إرسال الألبوم
+            open_files = []
             for i, p in enumerate(chunk):
                 try:
                     f = open(p, 'rb')
@@ -1143,25 +1168,27 @@ def send_photo_post(chat_id, assets):
                 except Exception as e:
                     logging.error(f"read album image failed: {e}")
             
-            if media:
+            if len(media) >= 2:
                 try:
                     bot.send_media_group(chat_id, media, timeout=180)
                 except Exception as e:
                     logging.error(f"send_media_group failed: {e}")
-                    # احتياطي: إذا فشل الألبوم لسبب ما، نرسلها كصور متتالية
+                    # احتياطي: إرسال كصور متتالية إذا فشل الألبوم لأي سبب
                     for f in open_files:
                         try:
                             f.seek(0)
                             bot.send_photo(chat_id, f, timeout=120)
-                        except Exception:
+                        except:
                             pass
             
-            # إغلاق الملفات بأمان بعد انتهاء الإرسال
+            # إغلاق الملفات بأمان بعد الإرسال
             for f in open_files:
                 try:
                     f.close()
                 except:
                     pass
+
+
 def send_bundle(chat_id, user_id, url, bundle: MediaBundle, workdir: str):
     """إرسال نتيجة أي استراتيجية (فيديوهات + صور + صوت)."""
     sent = False
