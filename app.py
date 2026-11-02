@@ -342,6 +342,8 @@ def base_ydl_opts():
         'fragment_retries': 8,
         'concurrent_fragment_downloads': 4,
         'ffmpeg_location': FFMPEG_PATH,
+        # السطر التالي هو الحل الجذري للمشكلة: إجبار المكتبة على تفضيل ترميز h264 المدعوم في كل الهواتف
+        'format_sort': ['vcodec:h264', 'vcodec:h265', 'ext:mp4:m4a'],
         'http_headers': {
             'User-Agent': USER_AGENT,
             'Accept-Language': 'en-US,en;q=0.9',
@@ -361,7 +363,6 @@ def base_ydl_opts():
     if COOKIES_FILE:
         opts['cookiefile'] = COOKIES_FILE
     return opts
-
 
 def _yt_opts(fmt, output_path, clients=None, player_skip=None):
     opts = base_ydl_opts()
@@ -455,13 +456,27 @@ def get_available_formats(url: str) -> list:
                     'ext': f.get('ext', 'mp4'),
                     'fps': f.get('fps'),
                     'tbr': f.get('tbr') or 0,
+                    'vcodec': f.get('vcodec', ''), # تمت إضافة هذا السطر لمعرفة الترميز
                 })
 
             seen = {}
             for f in formats:
                 h = f['height']
-                if h not in seen or f['tbr'] > seen[h]['tbr']:
+                vcodec = f.get('vcodec', '').lower()
+                # التحقق مما إذا كان الترميز مدعوماً في المعرض (H.264 / H.265)
+                is_avc = 'avc' in vcodec or 'h264' in vcodec or 'h265' in vcodec or 'hevc' in vcodec
+                
+                if h not in seen:
                     seen[h] = f
+                else:
+                    seen_vcodec = seen[h].get('vcodec', '').lower()
+                    seen_is_avc = 'avc' in seen_vcodec or 'h264' in seen_vcodec or 'h265' in seen_vcodec or 'hevc' in seen_vcodec
+                    
+                    # تفضيل الترميز المدعوم، وإذا كان كلاهما مدعوماً نأخذ الأعلى دقة (tbr)
+                    if is_avc and not seen_is_avc:
+                        seen[h] = f
+                    elif is_avc == seen_is_avc and f['tbr'] > seen[h]['tbr']:
+                        seen[h] = f
 
             unique = sorted(seen.values(), key=lambda x: x['height'], reverse=True)
             logging.info(f"Found {len(unique)} unique formats")
